@@ -299,7 +299,7 @@ if (isset($_GET['api'])) {
         .progress-text { font-size: 12px; margin-top: 3px; color: var(--secondary); display: flex; justify-content: space-between; }
 
         .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: var(--modal-bg); z-index: 1000; overflow-y: auto; }
-        .modal-content { background: var(--card-bg); max-width: 800px; margin: 40px auto; padding: 40px; border-radius: 8px; position: relative; font-size: 18px; line-height: 1.6; }
+        .modal-content { background: var(--card-bg); max-width: 90%; margin: 40px auto; padding: 40px; border-radius: 8px; position: relative; font-size: 18px; line-height: 1.6; }
         .modal-header-info { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; margin-bottom: 10px; }
         .modal-close { position: absolute; top: 15px; right: 20px; font-size: 28px; cursor: pointer; font-weight: bold; color: var(--secondary); }
 
