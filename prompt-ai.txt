@@ -53,4 +53,4 @@ Scrivimi un solo file index.php che contenga tutto (HTML, JS, CSS) e che deve sc
 
 19) nella pagina di visualizzazione ci deve essere un campo di ricerca che permetta di aggiungere parole chiave. Le parole chiave inserite devono poter essere cancellate tramite una X. I racconti devono essere filtrati nel titolo e nel contenuto in base alla presenza di tutte (AND) le parole.
 
-
+20) l'avvio dell'aggiornamento dei dati parte premendo un tasto e può essere interrotto premendo un tasto o chiudendo la pagina
