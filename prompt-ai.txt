@@ -1,0 +1,56 @@
+Scrivimi un solo file index.php che deve scaricare i racconti dalla URL "https://raccontimilu.com/racconti-erotici/racconti-erotici-sulla-dominazione/" seguendo questi requisiti funzionali:
+
+1) dalla URL "https://raccontimilu.com/racconti-erotici/racconti-erotici-sulla-dominazione/" devi recuperare il massimo numero di pagine (che chiameremo N) riportato nel blocco:
+<nav id="pagination" role="navigation" aria-label="Pagination Navigation" data-is-text="All items loaded"><ul class="page-numbers">
+	<li><span aria-current="page" class="page-numbers current">1</span></li>
+	<li><a class="page-numbers" href="https://raccontimilu.com/racconti-erotici/racconti-erotici-sulla-dominazione/page/2/">2</a></li>
+	<li><a class="page-numbers" href="https://raccontimilu.com/racconti-erotici/racconti-erotici-sulla-dominazione/page/3/">3</a></li>
+	<li><span class="page-numbers dots">…</span></li>
+	<li><a class="page-numbers" href="https://raccontimilu.com/racconti-erotici/racconti-erotici-sulla-dominazione/page/319/">319</a></li>
+	<li><a class="next page-numbers" href="https://raccontimilu.com/racconti-erotici/racconti-erotici-sulla-dominazione/page/2/">Next</a></li>
+</ul>
+</nav>
+
+3) in base al numero di pagine N, partendo dalla prima che ha questa URL: https://raccontimilu.com/racconti-erotici/racconti-erotici-sulla-dominazione/ devi aprire tutte le altre pagine che hanno URL: https://raccontimilu.com/racconti-erotici/racconti-erotici-sulla-dominazione/page/X/ dove X è il numero di pagina e va da 2 al massimo numero di pagine N
+
+4) ogni pagina contiene un certo numero di racconti (tag "article") ognuno avente il link alla pagina del racconto e il titolo
+<div class="post-header">
+<h3 class="title"><a href="https://raccontimilu.com/racconti-erotici-sulla-dominazione/la-nave-affonda-11-parte/"> La nave affonda 11. Parte</a></h3>
+</div>
+
+5) devi scaricare tutti i racconti salvando per ciascuno di essi le seguenti informazioni:
+- titolo
+- testo leggibile
+- autore
+- data di pubblicazione
+- hash della url che identifica univocamente il racconto
+
+6) dal testo leggibile devi eliminare qualsiasi link HTML, in quanto non fa parte del testo leggibile e devi fare sì che eventuali elementi tipografici vengano stampati bene (come le lettere accentate &egrave)
+
+7) voglio che salvi tutto in un file SQLlite (database)
+
+8) lo scaricamento deve avvenire in background, sfruttando per quanto possibile uno scaricamento in parallelo e in maniera asincrona rispetto alle azioni dell'utente
+
+9) il progresso dello scaricamento delle pagine e dei racconti deve essere tracciato
+
+10) il processo di scaricamento delle pagine e dei racconti deve poter essere interrotto e ripreso
+
+11) il processo di scaricamento dei racconti deve essere efficiente ed evitare di riscaricare link già scaricati e salvati nel database
+
+12) la visualizzazione dei racconti deve avvenire su una griglia, con inizialmente fino a 16 racconti, 4 per riga
+
+13) nella griglia i racconti devo riportare titolo, autore e una parte iniziale del racconto
+
+14) i racconti devono poter essere votati con un punteggio da 1 a 5 stelle. Il punteggio deve essere salvato nel database.
+
+15) i racconti devono poter essere scorsi mano a mano che si scrolla la pagina e si caricano 16 per volta
+
+16) nella pagina di visualizzazione si deve poter scegliere con che ordine organizzare i racconti (alfabetico, data di pubblicazione, voto)
+
+17) nella pagina di visualizzazione si deve poter scegliere se avere un tema light o dark dell'intera pagina
+
+18) quando si seleziona un racconto, si deve aprire una modale che ne permetta una lettura a piena pagina
+
+19) nella pagina di visualizzazione ci deve essere un campo di ricerca che permetta di aggiungere parole chiave. Le parole chiave inserite devono poter essere cancellate tramite una X. I racconti devono essere filtrati nel titolo e nel contenuto in base alla presenza di tutte (AND) le parole.
+
+
