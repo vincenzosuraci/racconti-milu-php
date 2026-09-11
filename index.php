@@ -39,6 +39,11 @@ if (isset($_GET['api'])) {
 
     try {
         switch ($_GET['api']) {
+            case 'get_count':
+                $total = (int)$pdo->query("SELECT COUNT(*) FROM stories")->fetchColumn();
+                echo json_encode(['total' => $total]);
+                break;
+
             case 'get_max_pages':
                 $html = fetchHtml("https://raccontimilu.com/racconti-erotici/racconti-erotici-sulla-dominazione/");
                 $dom = new DOMDocument();
@@ -192,6 +197,14 @@ if (isset($_GET['api'])) {
                         break;
                 }
 
+                // Conteggio totale storie nel DB
+                $totalCount = (int)$pdo->query("SELECT COUNT(*) FROM stories")->fetchColumn();
+
+                // Conteggio storie filtrate
+                $stmtCount = $pdo->prepare("SELECT COUNT(*) FROM stories $whereSql");
+                $stmtCount->execute($params);
+                $filteredCount = (int)$stmtCount->fetchColumn();
+
                 $sql = "SELECT hash, title, author, pub_date, rating, content FROM stories $whereSql $orderSql LIMIT $limit OFFSET $offset";
                 $stmt = $pdo->prepare($sql);
                 $stmt->execute($params);
@@ -201,7 +214,11 @@ if (isset($_GET['api'])) {
                     $story['excerpt'] = mb_substr(trim(strip_tags($story['content'])), 0, 200);
                 }
 
-                echo json_encode($stories);
+                echo json_encode([
+                        'stories' => $stories,
+                        'total' => $totalCount,
+                        'filtered' => $filteredCount
+                ]);
                 break;
 
             case 'rate':
@@ -236,6 +253,7 @@ if (isset($_GET['api'])) {
             --star-empty: #ccc;
             --star-fill: #f39c12;
             --modal-bg: rgba(0,0,0,0.8);
+            --badge-bg: #e9ecef;
         }
         [data-theme="dark"] {
             --bg-color: #121212;
@@ -247,6 +265,7 @@ if (isset($_GET['api'])) {
             --star-empty: #444;
             --star-fill: #f39c12;
             --modal-bg: rgba(0,0,0,0.9);
+            --badge-bg: #2a2a2a;
         }
 
         body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: var(--bg-color); color: var(--text-color); margin: 0; padding: 0; transition: all 0.3s ease; }
@@ -254,6 +273,8 @@ if (isset($_GET['api'])) {
         header { background: var(--card-bg); padding: 15px 20px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); position: sticky; top: 0; z-index: 100; border-bottom: 1px solid var(--border); }
         .header-controls { display: flex; flex-wrap: wrap; gap: 15px; align-items: center; justify-content: space-between; }
         .control-group { display: flex; align-items: center; gap: 10px; }
+
+        .db-count-badge { font-size: 13px; font-weight: normal; background: var(--badge-bg); padding: 4px 10px; border-radius: 12px; border: 1px solid var(--border); white-space: nowrap; color: var(--text-color); }
 
         button, select, input { padding: 8px 12px; border: 1px solid var(--border); border-radius: 5px; background: var(--bg-color); color: var(--text-color); cursor: pointer; }
         button.primary { background: var(--primary); color: white; border: none; font-weight: bold; }
@@ -311,7 +332,10 @@ if (isset($_GET['api'])) {
 <header>
     <div class="header-controls">
         <div class="control-group">
-            <h2 style="margin: 0; font-size: 20px;">Racconti Dominazione</h2>
+            <h2 style="margin: 0; font-size: 20px; display: flex; align-items: center; gap: 10px;">
+                Racconti Dominazione
+                <span class="db-count-badge" id="dbCountBadge">DB: <strong>0</strong></span>
+            </h2>
             <button id="themeToggle" title="Cambia Tema">🌓</button>
         </div>
 
@@ -421,6 +445,30 @@ if (isset($_GET['api'])) {
         return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#039;");
     }
 
+    // Aggiorna il badge del numero di racconti nel DB
+    function updateDbCount(total, filtered = null) {
+        const badge = document.getElementById('dbCountBadge');
+        if (!badge) return;
+        if (filtered !== null && keywords.length > 0) {
+            badge.innerHTML = `DB: <strong>${total}</strong> <small style="opacity:0.8;">(${filtered} filtrati)</small>`;
+        } else {
+            badge.innerHTML = `DB: <strong>${total}</strong>`;
+        }
+    }
+
+    // Richiede in modo dedicato il conteggio dal DB
+    async function fetchDbCount() {
+        try {
+            const res = await fetch('?api=get_count');
+            const data = await res.json();
+            if (data.total !== undefined) {
+                updateDbCount(data.total);
+            }
+        } catch(e) {
+            console.error("Errore recupero conteggio:", e);
+        }
+    }
+
     // Helper per generare l'HTML delle stelle e del tasto per annullare il voto
     function renderRatingHtml(hash, currentRating) {
         const showClear = currentRating > 0 ? 'inline-flex' : 'none';
@@ -448,7 +496,15 @@ if (isset($_GET['api'])) {
             const res = await fetch(`?api=get_stories&offset=${offset}&sort=${sort}&keywords=${kwJson}`);
             if (!res.ok) throw new Error(`HTTP Error ${res.status}`);
 
-            const stories = await res.json();
+            const data = await res.json();
+
+            // Retrocompatibilità sia per la nuova struttura che per eventuale array piano
+            const stories = Array.isArray(data) ? data : (data.stories || []);
+
+            if (data.total !== undefined) {
+                updateDbCount(data.total, data.filtered);
+            }
+
             if (!Array.isArray(stories)) throw new Error("Risposta API non valida");
 
             if (stories.length < 16) {
@@ -599,6 +655,7 @@ if (isset($_GET['api'])) {
         btnSync.innerText = 'Avvia Download';
         btnSync.classList.remove('danger');
         btnSync.classList.add('primary');
+        fetchDbCount(); // Aggiorna il contatore finale a fine download/interruzione
     }
 
     async function startSync() {
@@ -633,6 +690,7 @@ if (isset($_GET['api'])) {
 
             if (isSyncing) {
                 alert("Download e aggiornamento completati!");
+                await fetchDbCount();
                 reloadGrid();
                 stopSync();
             }
