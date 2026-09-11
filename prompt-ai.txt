@@ -1,4 +1,4 @@
-Scrivimi un solo file index.php che deve scaricare i racconti dalla URL "https://raccontimilu.com/racconti-erotici/racconti-erotici-sulla-dominazione/" seguendo questi requisiti funzionali:
+Scrivimi un solo file index.php che contenga tutto (HTML, JS, CSS) e che deve scaricare i racconti dalla URL "https://raccontimilu.com/racconti-erotici/racconti-erotici-sulla-dominazione/" seguendo questi requisiti funzionali:
 
 1) dalla URL "https://raccontimilu.com/racconti-erotici/racconti-erotici-sulla-dominazione/" devi recuperare il massimo numero di pagine (che chiameremo N) riportato nel blocco:
 <nav id="pagination" role="navigation" aria-label="Pagination Navigation" data-is-text="All items loaded"><ul class="page-numbers">

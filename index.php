@@ -2,3224 +2,561 @@
 declare(strict_types=1);
 
 /*
- * ============================================================
- *  ARCHIVIO RACCONTI - SINGLE FILE PHP
- * ============================================================
+ * Racconti Milù - downloader + reader, single-file PHP application.
+ * Requirements: PHP 8.1+, cURL, DOM, SQLite3, mbstring recommended.
  *
- *  Tutto in un unico file:
- *    - PHP backend
- *    - SQLite database
- *    - sincronizzazione remota
- *    - API AJAX
- *    - HTML
- *    - CSS
- *    - JavaScript
- *
- *  File creati nella stessa directory:
- *
- *    racconti.sqlite
- *    sync.lock
- *
- *  Il vecchio racconti.json viene mantenuto e, alla prima
- *  esecuzione, viene importato automaticamente in SQLite.
- *
- * ============================================================
+ * Put this file on a PHP-enabled web server. The PHP process must be allowed
+ * to run CLI children (proc_open/proc_get_status) for true background mode.
  */
 
-define(
-        'BASE_URL',
-        'https://raccontimilu.com/racconti-erotici/racconti-erotici-sulla-dominazione/'
+const BASE_URL = 'https://raccontimilu.com/racconti-erotici/racconti-erotici-sulla-dominazione/';
+const PAGE_SIZE = 16;
+const PAGE_CONCURRENCY = 8;
+const STORY_CONCURRENCY = 8;
+const HTTP_TIMEOUT = 30;
+const CONNECT_TIMEOUT = 10;
+const USER_AGENT = 'Mozilla/5.0 (compatible; RaccontiMilù-Reader/1.0; +https://raccontimilu.com/)';
+
+$dbFile = __DIR__ . '/racconti.sqlite';
+$lockFile = __DIR__ . '/racconti.worker.lock';
+
+function db(): SQLite3 {
+    static $db = null;
+    if ($db instanceof SQLite3) return $db;
+    $db = new SQLite3($GLOBALS['dbFile']);
+    $db->busyTimeout(10000);
+    $db->exec('PRAGMA journal_mode=WAL');
+    $db->exec('PRAGMA synchronous=NORMAL');
+    $db->exec('PRAGMA foreign_keys=ON');
+    initDb($db);
+    return $db;
+}
+
+function initDb(SQLite3 $db): void {
+    $db->exec(<<<SQL
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS pages (
+    page_no INTEGER PRIMARY KEY,
+    url TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    http_code INTEGER,
+    error TEXT,
+    discovered_at TEXT,
+    completed_at TEXT
+);
+CREATE TABLE IF NOT EXISTS stories (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    url TEXT NOT NULL UNIQUE,
+    url_hash TEXT NOT NULL UNIQUE,
+    title TEXT NOT NULL DEFAULT '',
+    content TEXT NOT NULL DEFAULT '',
+    author TEXT NOT NULL DEFAULT '',
+    published_at TEXT,
+    rating INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'pending',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    http_code INTEGER,
+    error TEXT,
+    source_page INTEGER,
+    discovered_at TEXT,
+    downloaded_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_stories_status ON stories(status);
+CREATE INDEX IF NOT EXISTS idx_stories_title ON stories(title COLLATE NOCASE);
+CREATE INDEX IF NOT EXISTS idx_stories_date ON stories(published_at);
+CREATE INDEX IF NOT EXISTS idx_stories_rating ON stories(rating);
+CREATE INDEX IF NOT EXISTS idx_pages_status ON pages(status);
+SQL);
+}
 
-define('DB_FILE', __DIR__ . '/racconti.sqlite');
-define('LEGACY_JSON', __DIR__ . '/racconti.json');
-define('SYNC_LOCK_FILE', __DIR__ . '/sync.lock');
+function setting(string $key, ?string $default = null): ?string {
+    $st = db()->prepare('SELECT value FROM settings WHERE key=:k');
+    $st->bindValue(':k', $key, SQLITE3_TEXT);
+    $r = $st->execute()->fetchArray(SQLITE3_ASSOC);
+    return $r ? (string)$r['value'] : $default;
+}
 
-define('STORIES_PER_PAGE', 24);
+function setSetting(string $key, string $value): void {
+    $st = db()->prepare('INSERT INTO settings(key,value) VALUES(:k,:v) ON CONFLICT(key) DO UPDATE SET value=excluded.value');
+    $st->bindValue(':k', $key, SQLITE3_TEXT);
+    $st->bindValue(':v', $value, SQLITE3_TEXT);
+    $st->execute();
+}
 
-/*
- * Numero massimo di richieste HTTP contemporanee.
- *
- * 6 è un buon compromesso per un normale hosting condiviso.
- * Se il server remoto tollera bene il traffico puoi portarlo
- * a 8 o 10.
- */
-define('DOWNLOAD_CONCURRENCY', 6);
-
-/*
- * Timeout delle richieste HTTP.
- */
-define('HTTP_CONNECT_TIMEOUT', 10);
-define('HTTP_TIMEOUT', 30);
-
-/*
- * Dopo quanto tempo permettere nuovamente una sincronizzazione
- * automatica.
- *
- * 0 = ad ogni apertura pagina viene sempre controllata la
- *     prima pagina remota.
- *
- * Questo è volutamente 0: puoi aggiornare la pagina quando vuoi.
- * Il controllo è comunque molto leggero perché vengono controllati
- * solo i nuovi URL.
- */
-define('SYNC_MIN_INTERVAL', 0);
-
-
-/* ============================================================
- * UTILITY
- * ============================================================ */
-
-function json_response(array $data, int $httpCode = 200): never
-{
-    http_response_code($httpCode);
+function jsonResponse(array $data, int $status=200): never {
+    http_response_code($status);
     header('Content-Type: application/json; charset=utf-8');
-
-    echo json_encode(
-            $data,
-            JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES
-    );
-
+    header('Cache-Control: no-store');
+    echo json_encode($data, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
     exit;
 }
 
-
-function h(string $value): string
-{
-    return htmlspecialchars($value, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+function cleanUrl(string $url): string {
+    $url = trim(html_entity_decode($url, ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+    $p = parse_url($url);
+    if (!$p || empty($p['host'])) return $url;
+    $scheme = strtolower($p['scheme'] ?? 'https');
+    $host = strtolower($p['host']);
+    $path = $p['path'] ?? '/';
+    $path = preg_replace('~/+~', '/', $path);
+    if ($path !== '/') $path = rtrim($path, '/') . '/';
+    return $scheme . '://' . $host . $path;
 }
 
-
-/* ============================================================
- * DATABASE
- * ============================================================ */
-
-function db(): PDO
-{
-    static $pdo = null;
-
-    if ($pdo instanceof PDO) {
-        return $pdo;
-    }
-
-    if (!extension_loaded('pdo_sqlite')) {
-        die(
-        'Errore: l\'estensione PHP PDO SQLite non è disponibile sul server.'
-        );
-    }
-
-    $pdo = new PDO('sqlite:' . DB_FILE);
-
-    $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-    $pdo->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
-
-    /*
-     * Migliora sensibilmente le prestazioni SQLite.
-     */
-    $pdo->exec('PRAGMA journal_mode = WAL');
-    $pdo->exec('PRAGMA synchronous = NORMAL');
-    $pdo->exec('PRAGMA foreign_keys = ON');
-    $pdo->exec('PRAGMA busy_timeout = 5000');
-
-    initialize_database($pdo);
-
-    return $pdo;
-}
-
-
-function initialize_database(PDO $pdo): void
-{
-    static $initialized = false;
-
-    if ($initialized) {
-        return;
-    }
-
-    $initialized = true;
-
-    $pdo->exec("
-        CREATE TABLE IF NOT EXISTS stories (
-            id TEXT PRIMARY KEY,
-            url TEXT NOT NULL UNIQUE,
-            title TEXT NOT NULL,
-            content TEXT NOT NULL,
-            rating INTEGER NOT NULL DEFAULT 0,
-            timestamp INTEGER NOT NULL
-        )
-    ");
-
-    $pdo->exec("
-        CREATE TABLE IF NOT EXISTS processed_urls (
-            url TEXT PRIMARY KEY,
-            status TEXT NOT NULL,
-            timestamp INTEGER NOT NULL
-        )
-    ");
-
-    $pdo->exec("
-        CREATE TABLE IF NOT EXISTS metadata (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        )
-    ");
-
-    /*
-     * Indici normali.
-     */
-    $pdo->exec("
-        CREATE INDEX IF NOT EXISTS idx_stories_timestamp
-        ON stories(timestamp DESC)
-    ");
-
-    $pdo->exec("
-        CREATE INDEX IF NOT EXISTS idx_stories_rating
-        ON stories(rating DESC)
-    ");
-
-    /*
-     * Proviamo ad attivare FTS5.
-     *
-     * Se la versione SQLite dell'hosting non lo supporta,
-     * l'applicazione continua comunque a funzionare usando
-     * LIKE come fallback.
-     */
-    try {
-        $pdo->exec("
-            CREATE VIRTUAL TABLE IF NOT EXISTS stories_fts
-            USING fts5(
-                title,
-                content,
-                content='stories',
-                content_rowid='rowid'
-            )
-        ");
-
-        $pdo->exec("
-            CREATE TRIGGER IF NOT EXISTS stories_ai
-            AFTER INSERT ON stories
-            BEGIN
-                INSERT INTO stories_fts(rowid, title, content)
-                VALUES (new.rowid, new.title, new.content);
-            END
-        ");
-
-        $pdo->exec("
-            CREATE TRIGGER IF NOT EXISTS stories_ad
-            AFTER DELETE ON stories
-            BEGIN
-                INSERT INTO stories_fts(
-                    stories_fts,
-                    rowid,
-                    title,
-                    content
-                )
-                VALUES (
-                    'delete',
-                    old.rowid,
-                    old.title,
-                    old.content
-                );
-            END
-        ");
-
-        $pdo->exec("
-            CREATE TRIGGER IF NOT EXISTS stories_au
-            AFTER UPDATE ON stories
-            BEGIN
-                INSERT INTO stories_fts(
-                    stories_fts,
-                    rowid,
-                    title,
-                    content
-                )
-                VALUES (
-                    'delete',
-                    old.rowid,
-                    old.title,
-                    old.content
-                );
-
-                INSERT INTO stories_fts(rowid, title, content)
-                VALUES (new.rowid, new.title, new.content);
-            END
-        ");
-
-        set_metadata($pdo, 'fts_enabled', '1');
-
-    } catch (Throwable $e) {
-        set_metadata($pdo, 'fts_enabled', '0');
-    }
-
-    /*
-     * Importazione automatica del vecchio JSON.
-     */
-    migrate_legacy_json($pdo);
-}
-
-
-function get_metadata(PDO $pdo, string $key, ?string $default = null): ?string
-{
-    $stmt = $pdo->prepare("
-        SELECT value
-        FROM metadata
-        WHERE key = ?
-        LIMIT 1
-    ");
-
-    $stmt->execute([$key]);
-
-    $value = $stmt->fetchColumn();
-
-    return $value === false ? $default : (string)$value;
-}
-
-
-function set_metadata(PDO $pdo, string $key, string $value): void
-{
-    $stmt = $pdo->prepare("
-        INSERT INTO metadata(key, value)
-        VALUES (?, ?)
-        ON CONFLICT(key)
-        DO UPDATE SET value = excluded.value
-    ");
-
-    $stmt->execute([$key, $value]);
-}
-
-
-/* ============================================================
- * MIGRAZIONE DAL VECCHIO racconti.json
- * ============================================================ */
-
-function migrate_legacy_json(PDO $pdo): void
-{
-    /*
-     * Se abbiamo già effettuato la migrazione, non rileggiamo
-     * mai più il JSON.
-     */
-    if (get_metadata($pdo, 'legacy_migration_done') === '1') {
-        return;
-    }
-
-    if (!file_exists(LEGACY_JSON)) {
-        set_metadata($pdo, 'legacy_migration_done', '1');
-        return;
-    }
-
-    $json = @file_get_contents(LEGACY_JSON);
-
-    if ($json === false || trim($json) === '') {
-        set_metadata($pdo, 'legacy_migration_done', '1');
-        return;
-    }
-
-    $data = json_decode($json, true);
-
-    if (!is_array($data)) {
-        set_metadata($pdo, 'legacy_migration_done', '1');
-        return;
-    }
-
-    /*
-     * Supportiamo entrambi i formati:
-     *
-     * vecchio:
-     * [
-     *   {...},
-     *   {...}
-     * ]
-     *
-     * nuovo:
-     * {
-     *   "urls": {...},
-     *   "stories": [...]
-     * }
-     */
-
-    if (isset($data['stories']) && is_array($data['stories'])) {
-        $stories = $data['stories'];
-    } else {
-        $stories = $data;
-    }
-
-    $pdo->beginTransaction();
-
-    try {
-
-        $insertStory = $pdo->prepare("
-            INSERT OR IGNORE INTO stories
-            (
-                id,
-                url,
-                title,
-                content,
-                rating,
-                timestamp
-            )
-            VALUES (?, ?, ?, ?, ?, ?)
-        ");
-
-        $insertUrl = $pdo->prepare("
-            INSERT OR IGNORE INTO processed_urls
-            (
-                url,
-                status,
-                timestamp
-            )
-            VALUES (?, ?, ?)
-        ");
-
-        foreach ($stories as $story) {
-
-            if (!is_array($story)) {
-                continue;
-            }
-
-            $url = trim((string)($story['url'] ?? ''));
-
-            if ($url === '') {
-                continue;
-            }
-
-            $title = trim((string)($story['title'] ?? ''));
-
-            $content = (string)($story['content'] ?? '');
-
-            $rating = max(
-                    0,
-                    min(
-                            5,
-                            (int)($story['rating'] ?? 0)
-                    )
-            );
-
-            $timestamp = (int)($story['timestamp'] ?? time());
-
-            if ($timestamp <= 0) {
-                $timestamp = time();
-            }
-
-            $id = (string)($story['id'] ?? md5($url));
-
-            /*
-             * Se il vecchio racconto non ha titolo valido,
-             * non lo mostriamo ma lo consideriamo comunque
-             * già processato.
-             */
-            if (
-                    $title === '' ||
-                    mb_strtolower(trim($title)) === 'senza titolo'
-            ) {
-
-                $insertUrl->execute([
-                        $url,
-                        'skipped',
-                        $timestamp
-                ]);
-
-                continue;
-            }
-
-            $insertStory->execute([
-                    $id,
-                    $url,
-                    $title,
-                    $content,
-                    $rating,
-                    $timestamp
-            ]);
-
-            $insertUrl->execute([
-                    $url,
-                    'saved',
-                    $timestamp
-            ]);
-        }
-
-        /*
-         * Se il JSON contiene anche URL già scartati ma che non
-         * sono presenti nell'array stories, li importiamo.
-         */
-        if (
-                isset($data['urls']) &&
-                is_array($data['urls'])
-        ) {
-
-            foreach ($data['urls'] as $url => $status) {
-
-                if (!is_string($url) || $url === '') {
-                    continue;
-                }
-
-                $status = ($status === 'skipped')
-                        ? 'skipped'
-                        : 'saved';
-
-                $insertUrl->execute([
-                        $url,
-                        $status,
-                        time()
-                ]);
-            }
-        }
-
-        $pdo->commit();
-
-        set_metadata(
-                $pdo,
-                'legacy_migration_done',
-                '1'
-        );
-
-        set_metadata(
-                $pdo,
-                'legacy_migration_time',
-                (string)time()
-        );
-
-    } catch (Throwable $e) {
-
-        if ($pdo->inTransaction()) {
-            $pdo->rollBack();
-        }
-
-        /*
-         * Non marchiamo la migrazione come completata:
-         * al successivo accesso potrà essere ritentata.
-         */
-    }
-}
-
-
-/* ============================================================
- * HTTP
- * ============================================================ */
-
-function http_get(string $url): ?string
-{
-    /*
-     * Preferiamo cURL.
-     */
-    if (function_exists('curl_init')) {
-
+function urlHash(string $url): string { return hash('sha256', cleanUrl($url)); }
+
+function httpMulti(array $urls, int $concurrency=8): array {
+    $urls = array_values(array_unique($urls));
+    $out = [];
+    $mh = curl_multi_init();
+    $queue = $urls;
+    $handles = [];
+
+    $add = function(string $url) use (&$mh, &$handles): void {
         $ch = curl_init($url);
-
         curl_setopt_array($ch, [
-                CURLOPT_RETURNTRANSFER => true,
-                CURLOPT_FOLLOWLOCATION => true,
-                CURLOPT_MAXREDIRS => 5,
-                CURLOPT_CONNECTTIMEOUT => HTTP_CONNECT_TIMEOUT,
-                CURLOPT_TIMEOUT => HTTP_TIMEOUT,
-                CURLOPT_ENCODING => '',
-                CURLOPT_USERAGENT =>
-                        'Mozilla/5.0 (compatible; RaccontiArchive/2.0)',
-                CURLOPT_HTTPHEADER => [
-                        'Accept: text/html,application/xhtml+xml',
-                        'Accept-Language: it-IT,it;q=0.9'
-                ]
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_MAXREDIRS => 5,
+            CURLOPT_CONNECTTIMEOUT => CONNECT_TIMEOUT,
+            CURLOPT_TIMEOUT => HTTP_TIMEOUT,
+            CURLOPT_USERAGENT => USER_AGENT,
+            CURLOPT_ENCODING => '',
+            CURLOPT_HTTPHEADER => ['Accept: text/html,application/xhtml+xml;q=0.9,*/*;q=0.8'],
+            CURLOPT_SSL_VERIFYPEER => true,
+            CURLOPT_SSL_VERIFYHOST => 2,
         ]);
-
-        $body = curl_exec($ch);
-
-        $httpCode = (int)curl_getinfo(
-                $ch,
-                CURLINFO_HTTP_CODE
-        );
-
-        curl_close($ch);
-
-        if (
-                $body === false ||
-                $httpCode < 200 ||
-                $httpCode >= 400
-        ) {
-            return null;
-        }
-
-        return (string)$body;
-    }
-
-    /*
-     * Fallback per server senza cURL.
-     */
-    $context = stream_context_create([
-            'http' => [
-                    'method' => 'GET',
-                    'timeout' => HTTP_TIMEOUT,
-                    'header' =>
-                            "User-Agent: Mozilla/5.0 (compatible; RaccontiArchive/2.0)\r\n" .
-                            "Accept: text/html,application/xhtml+xml\r\n"
-            ]
-    ]);
-
-    $body = @file_get_contents(
-            $url,
-            false,
-            $context
-    );
-
-    return $body === false ? null : $body;
-}
-
-
-/* ============================================================
- * PARSING HTML
- * ============================================================ */
-
-function parse_story_urls(string $html): array
-{
-    $dom = new DOMDocument();
-
-    @$dom->loadHTML(
-            '<?xml encoding="UTF-8">' . $html
-    );
-
-    $xpath = new DOMXPath($dom);
-
-    $nodes = $xpath->query(
-            "//a[
-            contains(concat(' ', normalize-space(@class), ' '), ' entry-title-link ')
-            or
-            contains(concat(' ', normalize-space(@class), ' '), ' post-title ')
-            or
-            @rel='bookmark'
-        ]"
-    );
-
-    /*
-     * Fallback.
-     */
-    if (!$nodes || $nodes->length === 0) {
-
-        $nodes = $xpath->query(
-                "//article//h2/a
-            |
-            //div[contains(@class, 'post')]//a"
-        );
-    }
-
-    $urls = [];
-
-    if (!$nodes) {
-        return [];
-    }
-
-    foreach ($nodes as $node) {
-
-        $href = trim(
-                (string)$node->getAttribute('href')
-        );
-
-        if ($href === '') {
-            continue;
-        }
-
-        /*
-         * Convertiamo eventuali URL relativi.
-         */
-        if (
-                !filter_var(
-                        $href,
-                        FILTER_VALIDATE_URL
-                )
-        ) {
-
-            $base = rtrim(BASE_URL, '/');
-
-            if (str_starts_with($href, '/')) {
-                $href = 'https://raccontimilu.com' . $href;
-            } else {
-                $href = $base . '/' . ltrim($href, '/');
-            }
-        }
-
-        if (
-                filter_var(
-                        $href,
-                        FILTER_VALIDATE_URL
-                ) &&
-                !in_array($href, $urls, true)
-        ) {
-            $urls[] = $href;
-        }
-    }
-
-    return $urls;
-}
-
-
-function parse_total_pages(string $html): int
-{
-    $dom = new DOMDocument();
-
-    @$dom->loadHTML(
-            '<?xml encoding="UTF-8">' . $html
-    );
-
-    $xpath = new DOMXPath($dom);
-
-    $totalPages = 1;
-
-    $nodes = $xpath->query(
-            "//nav[@id='pagination']//a[contains(@class, 'page-numbers')]
-        |
-        //a[contains(@class, 'page-numbers')]"
-    );
-
-    if (!$nodes) {
-        return 1;
-    }
-
-    foreach ($nodes as $node) {
-
-        $text = trim(
-                $node->textContent
-        );
-
-        if (
-                is_numeric($text) &&
-                (int)$text > $totalPages
-        ) {
-            $totalPages = (int)$text;
-        }
-    }
-
-    return max(1, $totalPages);
-}
-
-
-function parse_story(string $url, string $html): ?array
-{
-    $dom = new DOMDocument();
-
-    @$dom->loadHTML(
-            '<?xml encoding="UTF-8">' . $html
-    );
-
-    $xpath = new DOMXPath($dom);
-
-    /*
-     * Titolo.
-     */
-    $titleNode = $xpath->query(
-            "//h1[
-            contains(concat(' ', normalize-space(@class), ' '), ' entry-title ')
-            or
-            contains(concat(' ', normalize-space(@class), ' '), ' post-title ')
-        ]"
-    );
-
-    $title = '';
-
-    if (
-            $titleNode &&
-            $titleNode->length > 0
-    ) {
-        $title = trim(
-                $titleNode->item(0)->textContent
-        );
-    }
-
-    $title = html_entity_decode(
-            $title,
-            ENT_QUOTES | ENT_HTML5,
-            'UTF-8'
-    );
-
-    /*
-     * Racconti senza titolo:
-     * vengono considerati processati ma non salvati.
-     */
-    if (
-            $title === '' ||
-            mb_strtolower(trim($title)) === 'senza titolo'
-    ) {
-
-        return [
-                'status' => 'skipped',
-                'url' => $url
-        ];
-    }
-
-    /*
-     * Contenuto.
-     */
-    $contentNode = $xpath->query(
-            "//div[
-            contains(concat(' ', normalize-space(@class), ' '), ' entry-content ')
-            or
-            contains(concat(' ', normalize-space(@class), ' '), ' post-content ')
-        ]"
-    );
-
-    $text = '';
-
-    if (
-            $contentNode &&
-            $contentNode->length > 0
-    ) {
-
-        $container = $contentNode->item(0);
-
-        $paragraphs = $xpath->query(
-                './/p',
-                $container
-        );
-
-        $cleanParagraphs = [];
-
-        if ($paragraphs) {
-
-            foreach ($paragraphs as $p) {
-
-                $pText = trim(
-                        $p->textContent
-                );
-
-                if (
-                        $pText !== '' &&
-                        mb_strlen($pText) > 2
-                ) {
-
-                    if (
-                            stripos(
-                                    $pText,
-                                    'Condividi questo'
-                            ) !== false
-                    ) {
-                        continue;
-                    }
-
-                    if (
-                            stripos(
-                                    $pText,
-                                    'Mi piace:'
-                            ) !== false
-                    ) {
-                        continue;
-                    }
-
-                    $cleanParagraphs[] = $pText;
-                }
-            }
-        }
-
-        if (!empty($cleanParagraphs)) {
-
-            $text = implode(
-                    "\n\n",
-                    $cleanParagraphs
-            );
-
-        } else {
-
-            $text = strip_tags(
-                    $dom->saveHTML($container)
-            );
-        }
-    }
-
-    $text = html_entity_decode(
-            $text,
-            ENT_QUOTES | ENT_HTML5,
-            'UTF-8'
-    );
-
-    /*
-     * Normalizzazione spazi.
-     */
-    $text = preg_replace(
-            '/[ \t]+/',
-            ' ',
-            $text
-    );
-
-    $text = preg_replace(
-            "/\n{3,}/",
-            "\n\n",
-            $text
-    );
-
-    $text = trim((string)$text);
-
-    if ($text === '') {
-        return [
-                'status' => 'skipped',
-                'url' => $url
-        ];
-    }
-
-    return [
-            'status' => 'saved',
-            'id' => md5($url),
-            'url' => $url,
-            'title' => $title,
-            'content' => $text,
-            'rating' => 0,
-            'timestamp' => time()
-    ];
-}
-
-
-/* ============================================================
- * DATABASE - URL GIÀ PROCESSATI
- * ============================================================ */
-
-function get_known_urls(PDO $pdo, array $urls): array
-{
-    if (empty($urls)) {
-        return [];
-    }
-
-    /*
-     * SQLite ha un limite sul numero di parametri.
-     * Le pagine normalmente contengono pochi URL, ma dividiamo
-     * comunque in blocchi.
-     */
-    $known = [];
-
-    foreach (array_chunk($urls, 500) as $chunk) {
-
-        $placeholders = implode(
-                ',',
-                array_fill(0, count($chunk), '?')
-        );
-
-        $stmt = $pdo->prepare("
-            SELECT url
-            FROM processed_urls
-            WHERE url IN ($placeholders)
-        ");
-
-        $stmt->execute($chunk);
-
-        while ($row = $stmt->fetch()) {
-            $known[$row['url']] = true;
-        }
-    }
-
-    return $known;
-}
-
-
-/* ============================================================
- * DOWNLOAD PARALLELO
- * ============================================================ */
-
-function download_stories_parallel(array $urls): array
-{
-    if (empty($urls)) {
-        return [];
-    }
-
-    /*
-     * Se cURL non esiste, fallback sequenziale.
-     */
-    if (!function_exists('curl_multi_init')) {
-
-        $results = [];
-
-        foreach ($urls as $url) {
-
-            $html = http_get($url);
-
-            if ($html !== null) {
-
-                $story = parse_story(
-                        $url,
-                        $html
-                );
-
-                if ($story !== null) {
-                    $results[] = $story;
-                }
-            }
-        }
-
-        return $results;
-    }
-
-    $results = [];
-
-    /*
-     * Processiamo in piccoli batch.
-     */
-    foreach (
-            array_chunk(
-                    $urls,
-                    DOWNLOAD_CONCURRENCY
-            ) as $batch
-    ) {
-
-        $multi = curl_multi_init();
-
-        $handles = [];
-
-        foreach ($batch as $url) {
-
-            $ch = curl_init($url);
-
-            curl_setopt_array($ch, [
-                    CURLOPT_RETURNTRANSFER => true,
-                    CURLOPT_FOLLOWLOCATION => true,
-                    CURLOPT_MAXREDIRS => 5,
-                    CURLOPT_CONNECTTIMEOUT => HTTP_CONNECT_TIMEOUT,
-                    CURLOPT_TIMEOUT => HTTP_TIMEOUT,
-                    CURLOPT_ENCODING => '',
-                    CURLOPT_USERAGENT =>
-                            'Mozilla/5.0 (compatible; RaccontiArchive/2.0)',
-                    CURLOPT_HTTPHEADER => [
-                            'Accept: text/html,application/xhtml+xml',
-                            'Accept-Language: it-IT,it;q=0.9'
-                    ]
-            ]);
-
-            curl_multi_add_handle(
-                    $multi,
-                    $ch
-            );
-
-            $handles[(int)$ch] = [
-                    'handle' => $ch,
-                    'url' => $url
+        curl_multi_add_handle($mh, $ch);
+        $handles[(int)$ch] = ['ch'=>$ch, 'url'=>$url];
+    };
+
+    while ($queue || $handles) {
+        while ($queue && count($handles) < $concurrency) $add(array_shift($queue));
+        do { $mrc = curl_multi_exec($mh, $running); } while ($mrc === CURLM_CALL_MULTI_PERFORM);
+        if ($mrc !== CURLM_OK) break;
+        while ($info = curl_multi_info_read($mh)) {
+            $ch = $info['handle'];
+            $key = (int)$ch;
+            $meta = $handles[$key] ?? ['url'=>''];
+            $body = curl_multi_getcontent($ch);
+            $out[$meta['url']] = [
+                'body' => $body ?: '',
+                'code' => (int)curl_getinfo($ch, CURLINFO_HTTP_CODE),
+                'error' => curl_error($ch),
+                'effective_url' => (string)curl_getinfo($ch, CURLINFO_EFFECTIVE_URL),
             ];
-        }
-
-        /*
-         * Esecuzione multi-cURL.
-         */
-        $running = null;
-
-        do {
-
-            $status = curl_multi_exec(
-                    $multi,
-                    $running
-            );
-
-            if ($running) {
-                curl_multi_select(
-                        $multi,
-                        1.0
-                );
-            }
-
-        } while (
-                $running &&
-                $status === CURLM_OK
-        );
-
-        /*
-         * Recuperiamo i risultati.
-         */
-        foreach ($handles as $item) {
-
-            $ch = $item['handle'];
-            $url = $item['url'];
-
-            $html = curl_multi_getcontent($ch);
-
-            $httpCode = (int)curl_getinfo(
-                    $ch,
-                    CURLINFO_HTTP_CODE
-            );
-
-            if (
-                    $html !== false &&
-                    $html !== '' &&
-                    $httpCode >= 200 &&
-                    $httpCode < 400
-            ) {
-
-                $story = parse_story(
-                        $url,
-                        $html
-                );
-
-                if ($story !== null) {
-                    $results[] = $story;
-                }
-            }
-
-            curl_multi_remove_handle(
-                    $multi,
-                    $ch
-            );
-
+            curl_multi_remove_handle($mh, $ch);
             curl_close($ch);
+            unset($handles[$key]);
         }
-
-        curl_multi_close($multi);
+        if ($running) {
+            $n = curl_multi_select($mh, 1.0);
+            if ($n === -1) usleep(10000);
+        }
     }
-
-    return $results;
+    curl_multi_close($mh);
+    return $out;
 }
 
+function dom(string $html): ?DOMDocument {
+    if ($html === '') return null;
+    libxml_use_internal_errors(true);
+    $d = new DOMDocument('1.0', 'UTF-8');
+    $ok = $d->loadHTML('<?xml encoding="UTF-8">' . $html, LIBXML_NOWARNING | LIBXML_NOERROR | LIBXML_NONET);
+    libxml_clear_errors();
+    return $ok ? $d : null;
+}
 
-/* ============================================================
- * SALVATAGGIO BATCH
- * ============================================================ */
+function xpath(DOMDocument $d): DOMXPath { return new DOMXPath($d); }
 
-function save_stories_batch(PDO $pdo, array $stories): array
-{
-    if (empty($stories)) {
-        return [
-                'saved' => 0,
-                'skipped' => 0
-        ];
+function textOf(?DOMNode $node): string {
+    if (!$node) return '';
+    return trim(preg_replace('/\s+/u', ' ', html_entity_decode($node->textContent, ENT_QUOTES | ENT_HTML5, 'UTF-8')) ?? '');
+}
+
+function firstNode(DOMXPath $xp, array $queries): ?DOMNode {
+    foreach ($queries as $q) {
+        $n = $xp->query($q);
+        if ($n && $n->length) return $n->item(0);
+    }
+    return null;
+}
+
+function firstAttr(DOMXPath $xp, array $queries, string $attr): string {
+    $n = firstNode($xp, $queries);
+    return $n instanceof DOMElement ? trim($n->getAttribute($attr)) : '';
+}
+
+function parseMaxPage(string $html): int {
+    $d = dom($html); if (!$d) return 1;
+    $xp = xpath($d);
+    $max = 1;
+    $nodes = $xp->query("//*[@id='pagination']//a[contains(concat(' ', normalize-space(@class), ' '), ' page-numbers ')]");
+    foreach ($nodes as $n) {
+        $label = trim($n->textContent);
+        if (ctype_digit($label)) $max = max($max, (int)$label);
+        $href = $n->getAttribute('href');
+        if (preg_match('~/page/(\d+)/?~', $href, $m)) $max = max($max, (int)$m[1]);
+    }
+    return $max;
+}
+
+function pageUrl(int $n): string { return $n <= 1 ? BASE_URL : BASE_URL . 'page/' . $n . '/'; }
+
+function parseListing(string $html, int $pageNo): array {
+    $d = dom($html); if (!$d) return [];
+    $xp = xpath($d); $rows = [];
+    $articles = $xp->query('//article');
+    foreach ($articles as $article) {
+        $a = null;
+        foreach ([
+                     ".//h3[contains(concat(' ',normalize-space(@class),' '),' title ')]//a",
+                     ".//h2[contains(concat(' ',normalize-space(@class),' '),' title ')]//a",
+                     ".//a[contains(@href,'raccontimilu.com')][.//text()]"
+                 ] as $q) {
+            $nn = $xp->query($q, $article);
+            if ($nn && $nn->length) { $a = $nn->item(0); break; }
+        }
+        if (!$a instanceof DOMElement) continue;
+        $href = cleanUrl($a->getAttribute('href'));
+        if (!str_starts_with($href, 'https://raccontimilu.com/')) continue;
+        $title = textOf($a);
+        if ($title === '') continue;
+        $rows[$href] = ['url'=>$href, 'title'=>$title, 'source_page'=>$pageNo];
+    }
+    // Fallback for themes that don't wrap posts in <article>.
+    if (!$rows) {
+        $nodes = $xp->query("//h3[contains(concat(' ',normalize-space(@class),' '),' title ')]//a | //h2[contains(concat(' ',normalize-space(@class),' '),' title ')]//a");
+        foreach ($nodes as $a) {
+            if (!$a instanceof DOMElement) continue;
+            $href = cleanUrl($a->getAttribute('href'));
+            if (!str_starts_with($href, 'https://raccontimilu.com/')) continue;
+            if ($href === cleanUrl(BASE_URL) || preg_match('~/page/\d+/?$~', $href)) continue;
+            $rows[$href] = ['url'=>$href, 'title'=>textOf($a), 'source_page'=>$pageNo];
+        }
+    }
+    return array_values($rows);
+}
+
+function removeLinksAndNoise(DOMNode $root): string {
+    $doc = $root->ownerDocument;
+    if (!$doc) return '';
+    $xp = new DOMXPath($doc);
+    foreach ($xp->query('.//script|.//style|.//noscript|.//iframe|.//form', $root) as $n) $n->parentNode?->removeChild($n);
+    // Links are not part of the readable text. Keep their text, remove the <a> itself.
+    foreach ($xp->query('.//a', $root) as $a) {
+        $parent = $a->parentNode; if (!$parent) continue;
+        while ($a->firstChild) $parent->insertBefore($a->firstChild, $a);
+        $parent->removeChild($a);
+    }
+    $html = $doc->saveHTML($root) ?: '';
+    $html = preg_replace('~<\/?(?:img|figure|picture|svg|video|audio|source|button|input|textarea|select|option)[^>]*>.*?<\/(?:figure|picture|video|audio|select)>~is', ' ', $html) ?? $html;
+    $html = preg_replace('~<br\s*/?>~i', "\n", $html) ?? $html;
+    $html = preg_replace('~</p\s*>~i', "\n\n", $html) ?? $html;
+    $html = preg_replace('~</div\s*>~i', "\n", $html) ?? $html;
+    $html = preg_replace('~<[^>]+>~', ' ', $html) ?? $html;
+    $text = html_entity_decode($html, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+    $text = str_replace(["\xC2\xA0", "\r"], [' ', ''], $text);
+    $text = preg_replace("/[ \t]+/u", ' ', $text) ?? $text;
+    $text = preg_replace("/\n[ \t]+/u", "\n", $text) ?? $text;
+    $text = preg_replace("/\n{3,}/u", "\n\n", $text) ?? $text;
+    return trim($text);
+}
+
+function jsonLdObjects(DOMXPath $xp): array {
+    $out=[];
+    foreach ($xp->query("//script[@type='application/ld+json']") as $s) {
+        $raw=trim($s->textContent);
+        $j=json_decode($raw,true);
+        if (is_array($j)) {
+            if (isset($j['@graph']) && is_array($j['@graph'])) $out=array_merge($out,$j['@graph']);
+            else $out[]=$j;
+        }
+    }
+    return $out;
+}
+
+function parseStory(string $html, string $url): ?array {
+    $d = dom($html); if (!$d) return null;
+    $xp = xpath($d);
+    $title = textOf(firstNode($xp, [
+        '//article//h1', '//main//h1', '//h1'
+    ]));
+    $author = '';
+    $date = '';
+
+    $author = textOf(firstNode($xp, [
+        "//article//*[contains(concat(' ',normalize-space(@class),' '),' author ')]//a",
+        "//article//*[contains(concat(' ',normalize-space(@class),' '),' author ')]",
+        "//main//*[contains(concat(' ',normalize-space(@class),' '),' author ')]//a",
+        "//main//*[contains(concat(' ',normalize-space(@class),' '),' author ')]"
+    ]));
+    if (preg_match('/^By\s+/iu', $author)) $author = trim(preg_replace('/^By\s+/iu','',$author));
+
+    $date = firstAttr($xp, ["//meta[@property='article:published_time']", "//meta[@property='og:article:published_time']"], 'content');
+    if ($date === '') $date = firstAttr($xp, ["//meta[@name='date']", "//meta[@name='pubdate']"], 'content');
+    if ($date === '') $date = textOf(firstNode($xp, [
+        "//article//time[@datetime]", "//main//time[@datetime]", "//time[@datetime]"
+    ]));
+    if ($date === '') $date = firstAttr($xp, ["//article//time[@datetime]", "//main//time[@datetime]", "//time[@datetime]"], 'datetime');
+
+    foreach (jsonLdObjects($xp) as $obj) {
+        $type = is_string($obj['@type'] ?? null) ? strtolower($obj['@type']) : '';
+        if ($title === '' && in_array($type,['article','blogposting','newsarticle'],true)) $title = trim((string)($obj['headline'] ?? $obj['name'] ?? ''));
+        if ($author === '' && isset($obj['author'])) {
+            $aa=$obj['author'];
+            if (is_array($aa) && isset($aa['name'])) $author=trim((string)$aa['name']);
+            elseif (is_array($aa) && isset($aa[0]['name'])) $author=trim((string)$aa[0]['name']);
+        }
+        if ($date === '') $date=trim((string)($obj['datePublished'] ?? ''));
     }
 
-    $saved = 0;
-    $skipped = 0;
+    $contentNode = firstNode($xp, [
+        "//article//*[contains(concat(' ',normalize-space(@class),' '),' entry-content ')]",
+        "//article//*[contains(concat(' ',normalize-space(@class),' '),' post-content ')]",
+        "//article//*[contains(concat(' ',normalize-space(@class),' '),' content ')]",
+        "//main//*[contains(concat(' ',normalize-space(@class),' '),' entry-content ')]",
+        "//main//*[contains(concat(' ',normalize-space(@class),' '),' post-content ')]",
+        '//article', '//main'
+    ]);
+    if (!$contentNode) return null;
 
-    $pdo->beginTransaction();
-
-    try {
-
-        $insertStory = $pdo->prepare("
-            INSERT OR IGNORE INTO stories
-            (
-                id,
-                url,
-                title,
-                content,
-                rating,
-                timestamp
-            )
-            VALUES (?, ?, ?, ?, ?, ?)
-        ");
-
-        $insertUrl = $pdo->prepare("
-            INSERT OR REPLACE INTO processed_urls
-            (
-                url,
-                status,
-                timestamp
-            )
-            VALUES (?, ?, ?)
-        ");
-
-        foreach ($stories as $story) {
-
-            $url = $story['url'] ?? '';
-
-            if ($url === '') {
-                continue;
-            }
-
-            if (
-                    ($story['status'] ?? '') === 'skipped'
-            ) {
-
-                $insertUrl->execute([
-                        $url,
-                        'skipped',
-                        time()
-                ]);
-
-                $skipped++;
-
-                continue;
-            }
-
-            $insertStory->execute([
-                    $story['id'],
-                    $url,
-                    $story['title'],
-                    $story['content'],
-                    max(
-                            0,
-                            min(
-                                    5,
-                                    (int)$story['rating']
-                            )
-                    ),
-                    (int)$story['timestamp']
-            ]);
-
-            $insertUrl->execute([
-                    $url,
-                    'saved',
-                    (int)$story['timestamp']
-            ]);
-
-            if ($insertStory->rowCount() > 0) {
-                $saved++;
-            }
-        }
-
-        $pdo->commit();
-
-    } catch (Throwable $e) {
-
-        if ($pdo->inTransaction()) {
-            $pdo->rollBack();
-        }
-
-        throw $e;
+    // Clone before modifying, so title/metadata remain intact.
+    $content = $contentNode->cloneNode(true);
+    // Remove common non-story descendants.
+    $cx = new DOMXPath($content->ownerDocument);
+    foreach ($cx->query('.//h1|.//header|.//footer|.//*[contains(concat(" ",normalize-space(@class)," ")," comments ")]|.//*[contains(concat(" ",normalize-space(@class)," ")," author ")]|.//*[contains(concat(" ",normalize-space(@class)," ")," post-meta ")]', $content) as $n) {
+        if ($n !== $content) $n->parentNode?->removeChild($n);
     }
+    $readable = removeLinksAndNoise($content);
 
+    if ($title === '') $title = textOf(firstNode($xp, ['//h1']));
     return [
-            'saved' => $saved,
-            'skipped' => $skipped
+        'url'=>cleanUrl($url),
+        'url_hash'=>urlHash($url),
+        'title'=>$title,
+        'content'=>$readable,
+        'author'=>$author,
+        'published_at'=>normalizeDate($date),
     ];
 }
 
-
-/* ============================================================
- * LOCK SINCRONIZZAZIONE
- * ============================================================ */
-
-function acquire_sync_lock()
-{
-    $fp = @fopen(
-            SYNC_LOCK_FILE,
-            'c'
-    );
-
-    if (!$fp) {
-        return false;
-    }
-
-    /*
-     * LOCK_NB = non aspettare.
-     *
-     * Se un altro refresh sta sincronizzando, restituiamo
-     * immediatamente "busy".
-     */
-    if (!flock($fp, LOCK_EX | LOCK_NB)) {
-
-        fclose($fp);
-
-        return false;
-    }
-
-    return $fp;
+function normalizeDate(string $date): ?string {
+    $date=trim($date); if ($date==='') return null;
+    $ts=strtotime($date); return $ts ? date('Y-m-d H:i:s',$ts) : $date;
 }
 
+function ensurePages(int $n): void {
+    $st=db()->prepare('INSERT OR IGNORE INTO pages(page_no,url,status) VALUES(:n,:u,"pending")');
+    for($i=1;$i<=$n;$i++) { $st->bindValue(':n',$i,SQLITE3_INTEGER); $st->bindValue(':u',pageUrl($i),SQLITE3_TEXT); $st->execute(); }
+}
 
-/* ============================================================
- * SINCRONIZZAZIONE
- * ============================================================ */
+function spawnWorker(): bool {
+    global $lockFile;
+    $fp=@fopen($lockFile,'c');
+    if (!$fp) return false;
+    if (!flock($fp, LOCK_EX|LOCK_NB)) { fclose($fp); return true; }
+    // Keep lock only during spawn; worker obtains its own lock.
+    flock($fp, LOCK_UN); fclose($fp);
+    if (!function_exists('proc_open')) return false;
+    $php=PHP_BINARY;
+    $script=$_SERVER['SCRIPT_FILENAME'] ?? __FILE__;
+    $cmd=escapeshellarg($php).' '.escapeshellarg($script).' --worker';
+    $spec=[0=>['file','/dev/null','r'],1=>['file','/dev/null','a'],2=>['file','/dev/null','a']];
+    $p=@proc_open($cmd,$spec,$pipes,__DIR__);
+    if (is_resource($p)) { proc_close($p); return true; }
+    return false;
+}
 
-function synchronize(): array
-{
-    $pdo = db();
+function workerRunning(): bool {
+    global $lockFile;
+    $fp=@fopen($lockFile,'c'); if(!$fp) return false;
+    $ok=!flock($fp,LOCK_EX|LOCK_NB);
+    if(!$ok) { flock($fp,LOCK_UN); }
+    fclose($fp); return $ok;
+}
 
-    /*
-     * Evitiamo due sincronizzazioni contemporanee.
-     */
-    $lock = acquire_sync_lock();
-
-    if ($lock === false) {
-
-        return [
-                'status' => 'busy',
-                'message' =>
-                        'Una sincronizzazione è già in corso.'
-        ];
-    }
+function worker(): never {
+    global $lockFile;
+    $fp=@fopen($lockFile,'c');
+    if(!$fp || !flock($fp,LOCK_EX|LOCK_NB)) exit(0);
+    set_time_limit(0);
+    setSetting('worker','running');
+    setSetting('stop_requested','0');
 
     try {
-
-        $storyCount = (int)$pdo->query("
-            SELECT COUNT(*)
-            FROM stories
-        ")->fetchColumn();
-
-        $processedCount = (int)$pdo->query("
-            SELECT COUNT(*)
-            FROM processed_urls
-        ")->fetchColumn();
-
-        /*
-         * Archivio vuoto:
-         *
-         * dobbiamo fare la scansione completa.
-         *
-         * Archivio già popolato:
-         *
-         * partiamo dalla pagina 1 e continuiamo solo se troviamo
-         * materiale nuovo.
-         */
-        $initialImport = (
-                $storyCount === 0 &&
-                $processedCount === 0
-        );
-
-        $totalPages = 1;
-        $page = 1;
-
-        $newStories = 0;
-        $skipped = 0;
-        $pagesChecked = 0;
-        $errors = 0;
-
-        /*
-         * Prima pagina.
-         */
-        while (true) {
-
-            $pageUrl = (
-                    $page === 1
-            )
-                    ? BASE_URL
-                    : BASE_URL . 'page/' . $page . '/';
-
-            $html = http_get($pageUrl);
-
-            if ($html === null) {
-
-                $errors++;
-
-                /*
-                 * Se non riusciamo a leggere la pagina iniziale,
-                 * interrompiamo.
-                 */
-                if ($page === 1) {
-
-                    return [
-                            'status' => 'error',
-                            'message' =>
-                                    'Impossibile leggere il sito remoto.',
-                            'new_stories' => 0
-                    ];
-                }
-
-                break;
-            }
-
-            $pagesChecked++;
-
-            if ($page === 1) {
-                $totalPages = parse_total_pages($html);
-            }
-
-            $urls = parse_story_urls($html);
-
-            if (empty($urls)) {
-
-                /*
-                 * Pagina vuota.
-                 */
-                break;
-            }
-
-            $known = get_known_urls(
-                    $pdo,
-                    $urls
-            );
-
-            $newUrls = [];
-
-            foreach ($urls as $url) {
-
-                if (!isset($known[$url])) {
-                    $newUrls[] = $url;
-                }
-            }
-
-            /*
-             * ----------------------------------------------------
-             * CASO ARCHIVIO GIÀ POPOLATO
-             * ----------------------------------------------------
-             *
-             * Se la pagina contiene solo URL già conosciuti,
-             * possiamo fermarci immediatamente.
-             *
-             * Questo è il punto che elimina il problema originale:
-             * normalmente una sincronizzazione richiede UNA SOLA
-             * richiesta alla pagina 1.
-             */
-            if (!$initialImport && empty($newUrls)) {
-                break;
-            }
-
-            /*
-             * Scarichiamo SOLO gli URL nuovi.
-             */
-            if (!empty($newUrls)) {
-
-                $stories = download_stories_parallel(
-                        $newUrls
-                );
-
-                /*
-                 * Gli URL che non hanno prodotto una risposta valida
-                 * non vengono marcati come processed: potranno essere
-                 * ritentati al prossimo refresh.
-                 */
-                if (!empty($stories)) {
-
-                    $stats = save_stories_batch(
-                            $pdo,
-                            $stories
-                    );
-
-                    $newStories += $stats['saved'];
-                    $skipped += $stats['skipped'];
-                }
-
-                /*
-                 * Se una pagina contiene nuovi racconti, continuiamo
-                 * con la pagina successiva.
-                 *
-                 * In questo modo, se durante un periodo sono stati
-                 * pubblicati molti racconti, una singola sincronizzazione
-                 * riesce a recuperarli tutti.
-                 */
-            }
-
-            /*
-             * Archivio iniziale:
-             * dobbiamo arrivare fino all'ultima pagina.
-             *
-             * Archivio già popolato:
-             * continuiamo solo perché questa pagina aveva nuovi URL.
-             */
-            if ($page >= $totalPages) {
-                break;
-            }
-
-            $page++;
-
-            /*
-             * Sicurezza contro eventuali loop.
-             */
-            if ($page > 10000) {
-                break;
-            }
+        // Discover N from page 1 when needed.
+        $n=(int)(setting('total_pages','0') ?? '0');
+        if ($n<1) {
+            $r=httpMulti([BASE_URL],1)[BASE_URL] ?? null;
+            if(!$r || $r['code']<200 || $r['code']>=400) throw new RuntimeException('Impossibile scaricare la pagina iniziale.');
+            $n=parseMaxPage($r['body']);
+            setSetting('total_pages',(string)$n);
+            ensurePages($n);
         }
+        ensurePages($n);
 
-        set_metadata(
-                $pdo,
-                'last_sync',
-                (string)time()
-        );
-
-        set_metadata(
-                $pdo,
-                'last_sync_new_stories',
-                (string)$newStories
-        );
-
-        return [
-                'status' => 'success',
-                'new_stories' => $newStories,
-                'skipped' => $skipped,
-                'pages_checked' => $pagesChecked,
-                'initial_import' => $initialImport,
-                'errors' => $errors
-        ];
-
-    } finally {
-
-        flock(
-                $lock,
-                LOCK_UN
-        );
-
-        fclose($lock);
-    }
-}
-
-
-/* ============================================================
- * API
- * ============================================================ */
-
-if (isset($_GET['action'])) {
-
-    $action = (string)$_GET['action'];
-
-    /*
-     * ----------------------------------------------------------
-     * SINCRONIZZAZIONE
-     * ----------------------------------------------------------
-     */
-    if (
-            $action === 'sync' &&
-            $_SERVER['REQUEST_METHOD'] === 'POST'
-    ) {
-
-        try {
-
-            json_response(
-                    synchronize()
-            );
-
-        } catch (Throwable $e) {
-
-            json_response([
-                    'status' => 'error',
-                    'message' =>
-                            'Errore durante la sincronizzazione: ' .
-                            $e->getMessage()
-            ], 500);
-        }
-    }
-
-
-    /*
-     * ----------------------------------------------------------
-     * GET STORIES
-     * ----------------------------------------------------------
-     */
-    if ($action === 'get_stories') {
-
-        try {
-
-            $pdo = db();
-
-            $page = max(
-                    1,
-                    (int)($_GET['page'] ?? 1)
-            );
-
-            $limit = STORIES_PER_PAGE;
-
-            $offset = (
-                            $page - 1
-                    ) * $limit;
-
-            $sort = (string)(
-                    $_GET['sort'] ?? 'newest'
-            );
-
-            if (
-                    $sort !== 'rating' &&
-                    $sort !== 'newest'
-            ) {
-                $sort = 'newest';
-            }
-
-            $keywords = [];
-
-            if (
-                    isset($_GET['keywords'])
-            ) {
-
-                $decoded = json_decode(
-                        (string)$_GET['keywords'],
-                        true
-                );
-
-                if (
-                        is_array($decoded)
-                ) {
-
-                    foreach ($decoded as $keyword) {
-
-                        $keyword = trim(
-                                (string)$keyword
-                        );
-
-                        if ($keyword !== '') {
-                            $keywords[] = $keyword;
+        // Page discovery stage.
+        while ((int)db()->querySingle("SELECT COUNT(*) FROM pages WHERE status IN ('pending','error')") > 0) {
+            if (setting('stop_requested','0')==='1') { setSetting('worker','stopped'); exit(0); }
+            $rows=[]; $res=db()->query("SELECT page_no,url,attempts FROM pages WHERE status IN ('pending','error') ORDER BY page_no LIMIT ".PAGE_CONCURRENCY);
+            while($x=$res->fetchArray(SQLITE3_ASSOC)) $rows[]=$x;
+            if(!$rows) break;
+            $urls=array_column($rows,'url');
+            $results=httpMulti($urls,PAGE_CONCURRENCY);
+            db()->exec('BEGIN');
+            try {
+                foreach($rows as $row) {
+                    $url=$row['url']; $r=$results[$url]??null;
+                    $upd=db()->prepare('UPDATE pages SET attempts=attempts+1,http_code=:c,error=:e,status=:s,completed_at=:d WHERE page_no=:n');
+                    $upd->bindValue(':c',$r['code']??0,SQLITE3_INTEGER);
+                    $upd->bindValue(':e',($r && !$r['error'] ? null : ($r['error']??'HTTP error')),SQLITE3_TEXT);
+                    $ok=$r && $r['code']>=200 && $r['code']<400 && $r['body']!=='';
+                    $upd->bindValue(':s',$ok?'done':'error',SQLITE3_TEXT);
+                    $upd->bindValue(':d',$ok?date('Y-m-d H:i:s'):null,SQLITE3_TEXT);
+                    $upd->bindValue(':n',(int)$row['page_no'],SQLITE3_INTEGER); $upd->execute();
+                    if($ok) {
+                        $stories=parseListing($r['body'],(int)$row['page_no']);
+                        $ins=db()->prepare('INSERT OR IGNORE INTO stories(url,url_hash,title,status,source_page,discovered_at) VALUES(:u,:h,:t,"pending",:p,:d)');
+                        foreach($stories as $s){
+                            $ins->bindValue(':u',$s['url'],SQLITE3_TEXT); $ins->bindValue(':h',urlHash($s['url']),SQLITE3_TEXT); $ins->bindValue(':t',$s['title'],SQLITE3_TEXT); $ins->bindValue(':p',(int)$row['page_no'],SQLITE3_INTEGER); $ins->bindValue(':d',date('Y-m-d H:i:s'),SQLITE3_TEXT); $ins->execute();
                         }
                     }
                 }
-            }
+                db()->exec('COMMIT');
+            } catch(Throwable $e){ db()->exec('ROLLBACK'); throw $e; }
+        }
 
-            $ftsEnabled =
-                    get_metadata(
-                            $pdo,
-                            'fts_enabled',
-                            '0'
-                    ) === '1';
-
-            $where = [];
-            $params = [];
-
-            /*
-             * Ricerca.
-             */
-            if (
-                    !empty($keywords)
-            ) {
-
-                if ($ftsEnabled) {
-
-                    /*
-                     * Ogni keyword viene quotata e collegata con AND.
-                     */
-                    $ftsTerms = [];
-
-                    foreach ($keywords as $keyword) {
-
-                        /*
-                         * Escape delle virgolette per FTS5.
-                         */
-                        $safe = str_replace(
-                                '"',
-                                '""',
-                                $keyword
-                        );
-
-                        $ftsTerms[] =
-                                '"' . $safe . '"';
-                    }
-
-                    $match = implode(
-                            ' AND ',
-                            $ftsTerms
-                    );
-
-                    $where[] = "
-                        stories.rowid IN (
-                            SELECT rowid
-                            FROM stories_fts
-                            WHERE stories_fts MATCH :fts_match
-                        )
-                    ";
-
-                    $params[':fts_match'] = $match;
-
-                } else {
-
-                    /*
-                     * Fallback LIKE.
-                     *
-                     * Tutte le parole devono essere presenti.
-                     */
-                    foreach (
-                            $keywords as $index => $keyword
-                    ) {
-
-                        $param = ':kw' . $index;
-
-                        $where[] = "
-                            (
-                                title LIKE $param
-                                OR
-                                content LIKE $param
-                            )
-                        ";
-
-                        $params[$param] =
-                                '%' . $keyword . '%';
-                    }
+        // Story download stage.
+        while ((int)db()->querySingle("SELECT COUNT(*) FROM stories WHERE status IN ('pending','error')") > 0) {
+            if (setting('stop_requested','0')==='1') { setSetting('worker','stopped'); exit(0); }
+            $rows=[]; $res=db()->query("SELECT id,url,attempts FROM stories WHERE status IN ('pending','error') ORDER BY id LIMIT ".STORY_CONCURRENCY);
+            while($x=$res->fetchArray(SQLITE3_ASSOC)) $rows[]=$x;
+            if(!$rows) break;
+            $results=httpMulti(array_column($rows,'url'),STORY_CONCURRENCY);
+            db()->exec('BEGIN');
+            try {
+                foreach($rows as $row){
+                    $r=$results[$row['url']]??null;
+                    $parsed=null;
+                    if($r && $r['code']>=200 && $r['code']<400 && $r['body']!=='') $parsed=parseStory($r['body'],$row['url']);
+                    $ok=is_array($parsed) && $parsed['content']!=='';
+                    $st=$ok ? db()->prepare('UPDATE stories SET title=:t,content=:c,author=:a,published_at=:d,status="done",attempts=attempts+1,http_code=:h,error=NULL,downloaded_at=:now WHERE id=:id') : db()->prepare('UPDATE stories SET status="error",attempts=attempts+1,http_code=:h,error=:e WHERE id=:id');
+                    if($ok){$st->bindValue(':t',$parsed['title'],SQLITE3_TEXT);$st->bindValue(':c',$parsed['content'],SQLITE3_TEXT);$st->bindValue(':a',$parsed['author'],SQLITE3_TEXT);$st->bindValue(':d',$parsed['published_at'],SQLITE3_TEXT);$st->bindValue(':now',date('Y-m-d H:i:s'),SQLITE3_TEXT);} else {$st->bindValue(':e',$r['error']??'Parsing del racconto fallito',SQLITE3_TEXT);}
+                    $st->bindValue(':h',$r['code']??0,SQLITE3_INTEGER);$st->bindValue(':id',(int)$row['id'],SQLITE3_INTEGER);$st->execute();
                 }
-            }
-
-            $whereSql = '';
-
-            if (!empty($where)) {
-
-                $whereSql =
-                        'WHERE ' .
-                        implode(
-                                ' AND ',
-                                $where
-                        );
-            }
-
-            /*
-             * Ordinamento.
-             *
-             * Come nel vecchio codice:
-             *
-             * 1. prima i racconti votati
-             * 2. poi, in base alla modalità:
-             *      rating
-             *      oppure data
-             */
-            if ($sort === 'rating') {
-
-                $orderSql = "
-                    CASE WHEN rating > 0 THEN 0 ELSE 1 END,
-                    rating DESC,
-                    timestamp DESC
-                ";
-
-            } else {
-
-                $orderSql = "
-                    CASE WHEN rating > 0 THEN 0 ELSE 1 END,
-                    timestamp DESC
-                ";
-            }
-
-            /*
-             * Totale.
-             */
-            $countSql = "
-                SELECT COUNT(*)
-                FROM stories
-                $whereSql
-            ";
-
-            $stmt = $pdo->prepare(
-                    $countSql
-            );
-
-            foreach ($params as $key => $value) {
-                $stmt->bindValue(
-                        $key,
-                        $value,
-                        PDO::PARAM_STR
-                );
-            }
-
-            $stmt->execute();
-
-            $total = (int)$stmt->fetchColumn();
-
-            /*
-             * Racconti.
-             */
-            $sql = "
-                SELECT
-                    id,
-                    url,
-                    title,
-                    content,
-                    rating,
-                    timestamp
-                FROM stories
-                $whereSql
-                ORDER BY $orderSql
-                LIMIT :limit
-                OFFSET :offset
-            ";
-
-            $stmt = $pdo->prepare($sql);
-
-            foreach ($params as $key => $value) {
-                $stmt->bindValue(
-                        $key,
-                        $value,
-                        PDO::PARAM_STR
-                );
-            }
-
-            $stmt->bindValue(
-                    ':limit',
-                    $limit,
-                    PDO::PARAM_INT
-            );
-
-            $stmt->bindValue(
-                    ':offset',
-                    $offset,
-                    PDO::PARAM_INT
-            );
-
-            $stmt->execute();
-
-            $stories = $stmt->fetchAll();
-
-            json_response([
-                    'status' => 'success',
-                    'total' => $total,
-                    'page' => $page,
-                    'has_more' =>
-                            ($offset + $limit) < $total,
-                    'stories' => $stories
-            ]);
-
-        } catch (Throwable $e) {
-
-            json_response([
-                    'status' => 'error',
-                    'message' => $e->getMessage()
-            ], 500);
+                db()->exec('COMMIT');
+            } catch(Throwable $e){ db()->exec('ROLLBACK'); throw $e; }
         }
+        setSetting('worker','done');
+        setSetting('last_run',date('Y-m-d H:i:s'));
+    } catch(Throwable $e) {
+        setSetting('worker','error'); setSetting('last_error',$e->getMessage());
     }
-
-
-    /*
-     * ----------------------------------------------------------
-     * VOTO
-     * ----------------------------------------------------------
-     */
-    if (
-            $action === 'rate_story' &&
-            $_SERVER['REQUEST_METHOD'] === 'POST'
-    ) {
-
-        try {
-
-            $input = json_decode(
-                    file_get_contents('php://input'),
-                    true
-            );
-
-            $id = trim(
-                    (string)($input['id'] ?? '')
-            );
-
-            $rating = max(
-                    1,
-                    min(
-                            5,
-                            (int)($input['rating'] ?? 0)
-                    )
-            );
-
-            if ($id === '') {
-
-                json_response([
-                        'status' => 'error'
-                ], 400);
-            }
-
-            $pdo = db();
-
-            $stmt = $pdo->prepare("
-                UPDATE stories
-                SET rating = ?
-                WHERE id = ?
-            ");
-
-            $stmt->execute([
-                    $rating,
-                    $id
-            ]);
-
-            if ($stmt->rowCount() > 0) {
-
-                json_response([
-                        'status' => 'success'
-                ]);
-            }
-
-            json_response([
-                    'status' => 'error'
-            ], 404);
-
-        } catch (Throwable $e) {
-
-            json_response([
-                    'status' => 'error',
-                    'message' => $e->getMessage()
-            ], 500);
-        }
-    }
-
-
-    /*
-     * ----------------------------------------------------------
-     * STATISTICHE / STATO
-     * ----------------------------------------------------------
-     */
-    if ($action === 'status') {
-
-        try {
-
-            $pdo = db();
-
-            $count = (int)$pdo->query("
-                SELECT COUNT(*)
-                FROM stories
-            ")->fetchColumn();
-
-            $lastSync = (int)(
-            get_metadata(
-                    $pdo,
-                    'last_sync',
-                    '0'
-            )
-            );
-
-            json_response([
-                    'status' => 'success',
-                    'stories' => $count,
-                    'last_sync' => $lastSync
-            ]);
-
-        } catch (Throwable $e) {
-
-            json_response([
-                    'status' => 'error'
-            ], 500);
-        }
-    }
-
-
-    json_response([
-            'status' => 'error',
-            'message' => 'Azione non riconosciuta.'
-    ], 404);
+    flock($fp,LOCK_UN); fclose($fp); exit(0);
 }
 
+function progress(): array {
+    $d=db();
+    $totalPages=(int)(setting('total_pages','0')??0);
+    $pagesDone=(int)$d->querySingle("SELECT COUNT(*) FROM pages WHERE status='done'");
+    $pagesPending=(int)$d->querySingle("SELECT COUNT(*) FROM pages WHERE status IN ('pending','error')");
+    $storiesTotal=(int)$d->querySingle('SELECT COUNT(*) FROM stories');
+    $storiesDone=(int)$d->querySingle("SELECT COUNT(*) FROM stories WHERE status='done'");
+    $storiesPending=(int)$d->querySingle("SELECT COUNT(*) FROM stories WHERE status IN ('pending','error')");
+    return [
+        'worker'=>setting('worker','idle'), 'stop_requested'=>setting('stop_requested','0'),
+        'total_pages'=>$totalPages,'pages_done'=>$pagesDone,'pages_pending'=>$pagesPending,
+        'stories_total'=>$storiesTotal,'stories_done'=>$storiesDone,'stories_pending'=>$storiesPending,
+        'last_error'=>setting('last_error',''),'last_run'=>setting('last_run','')
+    ];
+}
 
-/* ============================================================
- * HTML
- * ============================================================ */
-?>
-<!DOCTYPE html>
-<html lang="it" data-theme="light">
+function likeEscape(string $s): string { return strtr($s,['\\'=>'\\\\','%'=>'\\%','_'=>'\\_']); }
 
-<head>
+// CLI worker.
+if (PHP_SAPI === 'cli' && in_array('--worker',$argv??[],true)) { db(); worker(); }
 
-    <meta charset="UTF-8">
+db();
+$action=$_GET['action']??'';
+if($action==='start'){
+    setSetting('stop_requested','0'); setSetting('last_error','');
+    if ((int)(setting('total_pages','0')??0) < 1) {
+        $r=httpMulti([BASE_URL],1)[BASE_URL]??null;
+        if(!$r || $r['code']<200 || $r['code']>=400) jsonResponse(['ok'=>false,'error'=>'Non riesco a scaricare la pagina iniziale.'],502);
+        $n=parseMaxPage($r['body']); setSetting('total_pages',(string)$n); ensurePages($n);
+        // Immediately parse page 1, so the UI has content even if CLI spawning is disabled.
+        $stories=parseListing($r['body'],1);
+        $st=db()->prepare('INSERT OR IGNORE INTO stories(url,url_hash,title,status,source_page,discovered_at) VALUES(:u,:h,:t,"pending",1,:d)');
+        foreach($stories as $s){$st->bindValue(':u',$s['url'],SQLITE3_TEXT);$st->bindValue(':h',urlHash($s['url']),SQLITE3_TEXT);$st->bindValue(':t',$s['title'],SQLITE3_TEXT);$st->bindValue(':d',date('Y-m-d H:i:s'),SQLITE3_TEXT);$st->execute();}
+        db()->exec("UPDATE pages SET status='done',http_code=".(int)$r['code'].",completed_at='".SQLite3::escapeString(date('Y-m-d H:i:s'))."' WHERE page_no=1");
+    }
+    $spawn=spawnWorker();
+    jsonResponse(['ok'=>true,'spawned'=>$spawn,'progress'=>progress()]);
+}
+if($action==='stop'){setSetting('stop_requested','1');jsonResponse(['ok'=>true,'progress'=>progress()]);}
+if($action==='reset'){
+    setSetting('stop_requested','1');
+    db()->exec('DELETE FROM stories'); db()->exec('DELETE FROM pages');
+    setSetting('total_pages','0'); setSetting('worker','idle'); setSetting('last_error','');
+    jsonResponse(['ok'=>true]);
+}
+if($action==='progress'){jsonResponse(['ok'=>true,'progress'=>progress()]);}
+if($action==='rate' && $_SERVER['REQUEST_METHOD']==='POST'){
+    $id=(int)($_POST['id']??0);$rating=max(0,min(5,(int)($_POST['rating']??0)));
+    $st=db()->prepare('UPDATE stories SET rating=:r WHERE id=:id');$st->bindValue(':r',$rating,SQLITE3_INTEGER);$st->bindValue(':id',$id,SQLITE3_INTEGER);$st->execute();jsonResponse(['ok'=>true]);
+}
+if($action==='story'){
+    $id=(int)($_GET['id']??0);$st=db()->prepare('SELECT id,url,title,content,author,published_at,rating FROM stories WHERE id=:id AND status="done"');$st->bindValue(':id',$id,SQLITE3_INTEGER);$r=$st->execute()->fetchArray(SQLITE3_ASSOC);if(!$r)jsonResponse(['ok'=>false],404);jsonResponse(['ok'=>true,'story'=>$r]);
+}
+if($action==='stories'){
+    $limit=max(1,min(100,(int)($_GET['limit']??PAGE_SIZE)));$offset=max(0,(int)($_GET['offset']??0));$sort=$_GET['sort']??'date';$dir=strtolower($_GET['dir']??'desc')==='asc'?'ASC':'DESC';
+    $allowed=['title'=>'title COLLATE NOCASE','date'=>'published_at','rating'=>'rating'];$order=$allowed[$sort]??$allowed['date'];
+    $q=trim((string)($_GET['q']??''));$words=preg_split('/\s+/u',$q,-1,PREG_SPLIT_NO_EMPTY)?:[];
+    $where=["status='done'"];$params=[];
+    foreach($words as $i=>$w){$p=':q'.$i;$where[]="(title LIKE $p ESCAPE '\\' OR content LIKE $p ESCAPE '\\')";$params[$p]='%'.likeEscape($w).'%';}
+    $sql='SELECT id,url,title,substr(content,1,420) preview,author,published_at,rating FROM stories WHERE '.implode(' AND ',$where).' ORDER BY '.$order.' '.$dir.', id DESC LIMIT :lim OFFSET :off';
+    $st=db()->prepare($sql);foreach($params as $p=>$v)$st->bindValue($p,$v,SQLITE3_TEXT);$st->bindValue(':lim',$limit,SQLITE3_INTEGER);$st->bindValue(':off',$offset,SQLITE3_INTEGER);$rs=[];$res=$st->execute();while($x=$res->fetchArray(SQLITE3_ASSOC))$rs[]=$x;
+    $countSql='SELECT COUNT(*) FROM stories WHERE '.implode(' AND ',$where);$ct=db()->prepare($countSql);foreach($params as $p=>$v)$ct->bindValue($p,$v,SQLITE3_TEXT);$total=(int)$ct->execute()->fetchArray(SQLITE3_NUM)[0];
+    jsonResponse(['ok'=>true,'items'=>$rs,'total'=>$total,'progress'=>progress()]);
+}
 
-    <meta
-            name="viewport"
-            content="width=device-width, initial-scale=1.0"
-    >
-
-    <title>Racconti Erotici - Sulla Dominazione</title>
-
+// HTML UI.
+?><!doctype html>
+<html lang="it"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Racconti di Dominazione</title>
     <style>
-
-        :root {
-            --bg-color: #f8f9fa;
-            --card-bg: #ffffff;
-            --text-color: #333333;
-            --text-muted: #6c757d;
-            --primary: #007bff;
-            --border-color: #ced4da;
-            --shadow: rgba(0,0,0,0.05);
-            --star-color: #e4e5e9;
-            --star-active: #ffc107;
-        }
-
-        [data-theme="dark"] {
-            --bg-color: #121212;
-            --card-bg: #1e1e1e;
-            --text-color: #e0e0e0;
-            --text-muted: #a0a0a0;
-            --primary: #bb86fc;
-            --border-color: #333333;
-            --shadow: rgba(0,0,0,0.5);
-            --star-color: #444444;
-            --star-active: #ffbb00;
-        }
-
-        * {
-            box-sizing: border-box;
-        }
-
-        body {
-            font-family:
-                    -apple-system,
-                    BlinkMacSystemFont,
-                    "Segoe UI",
-                    Roboto,
-                    sans-serif;
-
-            background: var(--bg-color);
-            color: var(--text-color);
-
-            margin: 0;
-            padding: 20px;
-
-            transition:
-                    background 0.3s,
-                    color 0.3s;
-        }
-
-        .container {
-            max-width: 1400px;
-            margin: 0 auto;
-        }
-
-        header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-
-            margin-bottom: 20px;
-
-            flex-wrap: wrap;
-            gap: 15px;
-        }
-
-        h1 {
-            font-size: 24px;
-            margin: 0;
-        }
-
-        .header-controls {
-            display: flex;
-            gap: 10px;
-            align-items: center;
-        }
-
-        .theme-toggle,
-        .sort-select,
-        .sync-button {
-            background: var(--card-bg);
-            border: 1px solid var(--border-color);
-            color: var(--text-color);
-
-            padding: 8px 15px;
-
-            border-radius: 20px;
-
-            cursor: pointer;
-
-            font-size: 14px;
-            font-weight: 600;
-        }
-
-        .sync-button {
-            background: var(--primary);
-            color: white;
-            border-color: var(--primary);
-        }
-
-        .sync-button:disabled {
-            opacity: 0.6;
-            cursor: wait;
-        }
-
-        #status-bar {
-            text-align: center;
-
-            font-size: 13px;
-            color: var(--text-muted);
-
-            margin-bottom: 20px;
-
-            background: var(--card-bg);
-
-            padding: 10px;
-
-            border-radius: 6px;
-
-            border: 1px solid var(--border-color);
-
-            min-height: 18px;
-        }
-
-        #search-container {
-            background: var(--card-bg);
-
-            padding: 15px;
-
-            border-radius: 8px;
-
-            border: 1px solid var(--border-color);
-
-            margin-bottom: 25px;
-        }
-
-        #tag-input {
-            width: 100%;
-
-            padding: 10px;
-
-            font-size: 15px;
-
-            border: 1px solid var(--border-color);
-
-            background: var(--bg-color);
-
-            color: var(--text-color);
-
-            border-radius: 4px;
-        }
-
-        #tags-list {
-            display: flex;
-            flex-wrap: wrap;
-
-            gap: 8px;
-
-            margin-top: 10px;
-        }
-
-        .tag {
-            background: var(--primary);
-
-            color: white;
-
-            padding: 6px 12px;
-
-            border-radius: 20px;
-
-            font-size: 13px;
-
-            display: inline-flex;
-
-            align-items: center;
-
-            gap: 8px;
-        }
-
-        .tag .remove-tag {
-            cursor: pointer;
-
-            font-weight: bold;
-
-            background: rgba(255,255,255,0.2);
-
-            border-radius: 50%;
-
-            width: 18px;
-            height: 18px;
-
-            display: inline-flex;
-
-            align-items: center;
-            justify-content: center;
-        }
-
-        #stories-container {
-            display: grid;
-
-            grid-template-columns: repeat(1, 1fr);
-
-            gap: 20px;
-        }
-
-        @media (min-width: 600px) {
-            #stories-container {
-                grid-template-columns: repeat(2, 1fr);
-            }
-        }
-
-        @media (min-width: 992px) {
-            #stories-container {
-                grid-template-columns: repeat(3, 1fr);
-            }
-        }
-
-        @media (min-width: 1300px) {
-            #stories-container {
-                grid-template-columns: repeat(4, 1fr);
-            }
-        }
-
-        .story-card {
-            background: var(--card-bg);
-
-            padding: 20px;
-
-            border-radius: 8px;
-
-            border: 1px solid var(--border-color);
-
-            display: flex;
-
-            flex-direction: column;
-
-            justify-content: space-between;
-
-            box-shadow:
-                    0 2px 5px var(--shadow);
-        }
-
-        .story-card h3 {
-            margin-top: 0;
-
-            color: var(--primary);
-
-            font-size: 17px;
-
-            cursor: pointer;
-        }
-
-        .story-content-preview {
-            line-height: 1.5;
-
-            max-height: 90px;
-
-            overflow: hidden;
-
-            color: var(--text-muted);
-
-            font-size: 13px;
-
-            margin-bottom: 15px;
-
-            cursor: pointer;
-
-            white-space: pre-line;
-        }
-
-        .rating-stars {
-            display: flex;
-
-            gap: 4px;
-
-            align-items: center;
-
-            margin-top: 10px;
-
-            border-top: 1px solid var(--border-color);
-
-            padding-top: 10px;
-        }
-
-        .star-container {
-            display: inline-flex;
-
-            flex-direction: row-reverse;
-
-            justify-content: flex-end;
-        }
-
-        .star-container input {
-            display: none;
-        }
-
-        .star-container label {
-            font-size: 22px;
-
-            color: var(--star-color);
-
-            cursor: pointer;
-        }
-
-        .star-container label:hover,
-        .star-container label:hover ~ label,
-        .star-container input:checked ~ label {
-            color: var(--star-active);
-        }
-
-        #modal-overlay {
-            position: fixed;
-
-            top: 0;
-            left: 0;
-
-            width: 100%;
-            height: 100%;
-
-            background: rgba(0,0,0,0.75);
-
-            display: none;
-
-            justify-content: center;
-            align-items: center;
-
-            z-index: 1000;
-
-            padding: 20px;
-        }
-
-        #modal-content {
-            background: var(--card-bg);
-
-            color: var(--text-color);
-
-            width: 100%;
-
-            max-width: 900px;
-
-            height: 85vh;
-
-            border-radius: 12px;
-
-            padding: 30px;
-
-            display: flex;
-
-            flex-direction: column;
-
-            border: 1px solid var(--border-color);
-
-            position: relative;
-        }
-
-        #modal-body {
-            overflow-y: auto;
-
-            line-height: 1.8;
-
-            font-size: 16px;
-
-            flex-grow: 1;
-
-            white-space: pre-wrap;
-        }
-
-        .close-modal {
-            position: absolute;
-
-            top: 20px;
-            right: 25px;
-
-            background: none;
-
-            border: none;
-
-            font-size: 28px;
-
-            color: var(--text-color);
-
-            cursor: pointer;
-        }
-
-        #loading {
-            text-align: center;
-
-            padding: 30px;
-
-            font-weight: bold;
-
-            color: var(--text-muted);
-
-            grid-column: 1 / -1;
-
-            display: none;
-        }
-
-        #sync-indicator {
-            display: inline-block;
-
-            width: 8px;
-            height: 8px;
-
-            border-radius: 50%;
-
-            background: var(--text-muted);
-
-            margin-right: 5px;
-        }
-
-    </style>
-
-</head>
-
-<body>
-
-<div class="container">
-
-    <header>
-
-        <h1>Racconti di Dominazione</h1>
-
-        <div class="header-controls">
-
-            <select
-                    id="sort-select"
-                    class="sort-select"
-                    onchange="changeSort()"
-            >
-                <option value="newest">
-                    🕒 Più recenti
-                </option>
-
-                <option value="rating">
-                    ⭐ Voto più alto
-                </option>
-            </select>
-
-            <button
-                    class="sync-button"
-                    id="sync-button"
-                    onclick="manualSync()"
-            >
-                🔄 Aggiorna
-            </button>
-
-            <button
-                    class="theme-toggle"
-                    onclick="toggleTheme()"
-            >
-                🌓 Tema
-            </button>
-
-        </div>
-
-    </header>
-
-    <div id="status-bar">
-        <span id="sync-indicator"></span>
-        Caricamento archivio locale...
-    </div>
-
-    <div id="search-container">
-
-        <input
-                type="text"
-                id="tag-input"
-                placeholder="Scrivi una parola chiave e premi Invio per aggiungere un filtro (AND)..."
-        >
-
-        <div id="tags-list"></div>
-
-    </div>
-
-    <div id="stories-container"></div>
-
-    <div id="loading">
-        Caricamento altri racconti...
-    </div>
-
-</div>
-
-
-<div
-        id="modal-overlay"
-        onclick="closeModalOnOutside(event)"
->
-
-    <div id="modal-content">
-
-        <button
-                class="close-modal"
-                onclick="closeModal()"
-        >
-            &times;
-        </button>
-
-        <div
-                style="
-                margin-bottom:20px;
-                border-bottom:1px solid var(--border-color);
-                padding-bottom:15px;
-            "
-        >
-
-            <h2
-                    id="modal-title"
-                    style="
-                    margin:0 0 10px 0;
-                    color:var(--primary);
-                "
-            ></h2>
-
-            <div
-                    id="modal-stars"
-                    class="rating-stars"
-            ></div>
-
-        </div>
-
-        <div id="modal-body"></div>
-
-    </div>
-
-</div>
-
-
+        :root{--bg:#f4f5f7;--fg:#20242a;--muted:#69717d;--card:#fff;--border:#dfe3e8;--accent:#6c4cff;--star:#e2a800;--shadow:0 5px 22px rgba(0,0,0,.07)}
+        [data-theme=dark]{--bg:#111318;--fg:#edf0f5;--muted:#9da6b2;--card:#1a1e25;--border:#303641;--accent:#9b87ff;--shadow:0 7px 28px rgba(0,0,0,.28)}
+        *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif}.wrap{max-width:1500px;margin:auto;padding:22px}.top{position:sticky;top:0;z-index:5;background:color-mix(in srgb,var(--bg) 92%,transparent);backdrop-filter:blur(10px);padding-bottom:15px}.bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.bar h1{margin:0 20px 0 0;font-size:24px}.search{display:flex;flex:1;min-width:250px;gap:8px}.search input{flex:1}.input,select,button{border:1px solid var(--border);background:var(--card);color:var(--fg);border-radius:9px;padding:9px 11px;font:inherit}button{cursor:pointer}.primary{background:var(--accent);color:white;border-color:var(--accent)}.progress{margin-top:12px;background:var(--card);border:1px solid var(--border);padding:10px 12px;border-radius:10px}.track{height:8px;background:var(--border);border-radius:99px;overflow:hidden}.fill{height:100%;width:0;background:var(--accent);transition:width .25s}.status{display:flex;gap:18px;flex-wrap:wrap;color:var(--muted);margin-top:7px;font-size:13px}.chips{display:flex;gap:7px;flex-wrap:wrap;margin:10px 0}.chip{border:1px solid var(--border);border-radius:99px;padding:4px 8px;background:var(--card)}.chip button{border:0;padding:0 0 0 5px;background:none;color:var(--muted)}.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px;margin-top:18px}.card{background:var(--card);border:1px solid var(--border);border-radius:13px;padding:17px;box-shadow:var(--shadow);min-height:220px;display:flex;flex-direction:column}.card h2{font-size:18px;line-height:1.25;margin:0 0 8px}.meta{font-size:13px;color:var(--muted);margin-bottom:11px}.preview{white-space:pre-line;color:var(--fg);opacity:.88;display:-webkit-box;-webkit-line-clamp:7;-webkit-box-orient:vertical;overflow:hidden;cursor:pointer}.card .bottom{margin-top:auto;display:flex;justify-content:space-between;align-items:center;padding-top:12px}.stars{display:inline-flex;gap:1px}.star{font-size:22px;border:0;padding:0;background:none;color:#aeb5be;line-height:1}.star.on{color:var(--star)}.modal{position:fixed;inset:0;background:rgba(0,0,0,.72);z-index:20;display:none;padding:20px}.modal.show{display:block}.reader{max-width:1000px;height:100%;margin:auto;background:var(--card);color:var(--fg);border-radius:12px;overflow:auto;position:relative}.reader-head{position:sticky;top:0;background:var(--card);border-bottom:1px solid var(--border);padding:18px 24px;z-index:1}.reader-head h2{margin:0 35px 5px 0}.close{position:absolute;right:12px;top:10px;font-size:28px;border:0;background:none}.reader-body{padding:24px;font-size:18px;line-height:1.75;white-space:pre-wrap}.reader-body a{color:inherit}.loader{text-align:center;color:var(--muted);padding:30px}.hidden{display:none}@media(max-width:1050px){.grid{grid-template-columns:repeat(3,1fr)}}@media(max-width:760px){.grid{grid-template-columns:repeat(2,1fr)}}@media(max-width:520px){.grid{grid-template-columns:1fr}.wrap{padding:12px}.bar h1{width:100%}}
+    </style></head><body>
+<div class="wrap"><div class="top"><div class="bar"><h1>Racconti</h1><div class="search"><input id="search" class="input" placeholder="Aggiungi una parola chiave e premi Invio"><button id="clearSearch" title="Cancella ricerca">×</button></div><select id="sort"><option value="date:desc">Data ↓</option><option value="date:asc">Data ↑</option><option value="title:asc">Alfabetico A→Z</option><option value="title:desc">Alfabetico Z→A</option><option value="rating:desc">Voto ↓</option><option value="rating:asc">Voto ↑</option></select><button id="theme">☾</button><button id="start" class="primary">Avvia / riprendi</button><button id="stop">Ferma</button></div><div id="chips" class="chips"></div><div class="progress"><div class="track"><div id="fill" class="fill"></div></div><div id="status" class="status"></div></div></div>
+    <div id="grid" class="grid"></div><div id="loader" class="loader">Caricamento…</div></div>
+<div id="modal" class="modal"><article class="reader"><div class="reader-head"><button class="close" id="close">×</button><h2 id="rt"></h2><div id="rm" class="meta"></div><div id="rs"></div></div><div id="rb" class="reader-body"></div></article></div>
 <script>
-
-    /* ============================================================
-     * STATO
-     * ============================================================ */
-
-    let keywords = [];
-
-    let currentPage = 1;
-
-    let isLoading = false;
-
-    let hasMore = true;
-
-    let currentSort = 'newest';
-
-    let globalStoriesMap = {};
-
-    let syncRunning = false;
-
-
-    /* ============================================================
-     * TEMA
-     * ============================================================ */
-
-    function toggleTheme() {
-
-        const html = document.documentElement;
-
-        const newTheme =
-            html.getAttribute('data-theme') === 'dark'
-                ? 'light'
-                : 'dark';
-
-        html.setAttribute(
-            'data-theme',
-            newTheme
-        );
-
-        localStorage.setItem(
-            'theme',
-            newTheme
-        );
-    }
-
-
-    if (
-        localStorage.getItem('theme') === 'dark'
-    ) {
-
-        document.documentElement.setAttribute(
-            'data-theme',
-            'dark'
-        );
-    }
-
-
-    /* ============================================================
-     * ORDINAMENTO
-     * ============================================================ */
-
-    function changeSort() {
-
-        currentSort =
-            document.getElementById(
-                'sort-select'
-            ).value;
-
-        resetAndLoad();
-    }
-
-
-    /* ============================================================
-     * STATUS
-     * ============================================================ */
-
-    function setStatus(
-        text,
-        syncing = false
-    ) {
-
-        document.getElementById(
-            'status-bar'
-        ).innerHTML =
-            '<span id="sync-indicator"></span>' +
-            escapeHtml(text);
-
-        const indicator =
-            document.getElementById(
-                'sync-indicator'
-            );
-
-        if (syncing) {
-
-            indicator.style.background =
-                'var(--primary)';
-
-            indicator.style.animation =
-                'pulse 1s infinite';
-
-        } else {
-
-            indicator.style.background =
-                'var(--text-muted)';
-
-            indicator.style.animation =
-                'none';
-        }
-    }
-
-
-    /* ============================================================
-     * TAG
-     * ============================================================ */
-
-    const tagInput =
-        document.getElementById(
-            'tag-input'
-        );
-
-
-    tagInput.addEventListener(
-        'keydown',
-        function(e) {
-
-            if (e.key !== 'Enter') {
-                return;
-            }
-
-            e.preventDefault();
-
-            const val =
-                this.value.trim();
-
-            if (
-                val &&
-                !keywords.includes(val)
-            ) {
-
-                keywords.push(val);
-
-                this.value = '';
-
-                renderTags();
-
-                resetAndLoad();
-            }
-        }
-    );
-
-
-    function removeKeyword(index) {
-
-        keywords.splice(
-            index,
-            1
-        );
-
-        renderTags();
-
-        resetAndLoad();
-    }
-
-
-    function renderTags() {
-
-        const container =
-            document.getElementById(
-                'tags-list'
-            );
-
-        container.innerHTML = '';
-
-        keywords.forEach(
-            (kw, index) => {
-
-                const tag =
-                    document.createElement(
-                        'div'
-                    );
-
-                tag.className = 'tag';
-
-                tag.innerHTML =
-                    escapeHtml(kw) +
-                    ' <span class="remove-tag" ' +
-                    'onclick="removeKeyword(' +
-                    index +
-                    ')">&times;</span>';
-
-                container.appendChild(tag);
-            }
-        );
-    }
-
-
-    /* ============================================================
-     * STELLE
-     * ============================================================ */
-
-    function renderStarRating(
-        storyId,
-        currentRating
-    ) {
-
-        let html =
-            '<div class="star-container">';
-
-        for (
-            let i = 5;
-            i >= 1;
-            i--
-        ) {
-
-            const checked =
-                i === Number(currentRating)
-                    ? 'checked'
-                    : '';
-
-            html +=
-                '<input ' +
-                'type="radio" ' +
-                'id="star-' +
-                storyId +
-                '-' +
-                i +
-                '" ' +
-                'name="rating-' +
-                storyId +
-                '" ' +
-                'value="' +
-                i +
-                '" ' +
-                checked +
-                ' ' +
-                'onclick="rateStory(\'' +
-                storyId +
-                '\', ' +
-                i +
-                ')">' +
-
-                '<label for="star-' +
-                storyId +
-                '-' +
-                i +
-                '">' +
-                '&#9733;' +
-                '</label>';
-        }
-
-        return html +
-            '</div>';
-    }
-
-
-    /* ============================================================
-     * CARICAMENTO RACCONTI
-     * ============================================================ */
-
-    function loadStories(
-        append = false
-    ) {
-
-        if (isLoading) {
-            return;
-        }
-
-        isLoading = true;
-
-        document.getElementById(
-            'loading'
-        ).style.display = 'block';
-
-        const kwParam =
-            encodeURIComponent(
-                JSON.stringify(keywords)
-            );
-
-        fetch(
-            '?action=get_stories' +
-            '&page=' +
-            currentPage +
-            '&keywords=' +
-            kwParam +
-            '&sort=' +
-            encodeURIComponent(
-                currentSort
-            ),
-            {
-                cache: 'no-store'
-            }
-        )
-
-            .then(res => res.json())
-
-            .then(data => {
-
-                if (
-                    data.status !== 'success'
-                ) {
-                    throw new Error(
-                        'Errore caricamento'
-                    );
-                }
-
-                hasMore =
-                    Boolean(data.has_more);
-
-                const container =
-                    document.getElementById(
-                        'stories-container'
-                    );
-
-                if (!append) {
-
-                    container.innerHTML = '';
-
-                    globalStoriesMap = {};
-                }
-
-                if (
-                    data.stories.length === 0 &&
-                    !append
-                ) {
-
-                    container.innerHTML =
-                        '<div style="' +
-                        'text-align:center;' +
-                        'color:var(--text-muted);' +
-                        'padding:40px;' +
-                        'grid-column:1/-1;">' +
-
-                        'Nessun racconto trovato ' +
-                        'nell\'archivio locale.' +
-
-                        '</div>';
-
-                } else {
-
-                    /*
-                     * Non sovrascriviamo lo status di sincronizzazione
-                     * se in quel momento sta lavorando.
-                     */
-                    if (!syncRunning) {
-
-                        setStatus(
-                            'Racconti presenti in archivio: ' +
-                            data.total
-                        );
-                    }
-                }
-
-                data.stories.forEach(
-                    story => {
-
-                        globalStoriesMap[
-                            story.id
-                            ] = story;
-
-                        const card =
-                            document.createElement(
-                                'div'
-                            );
-
-                        card.className =
-                            'story-card';
-
-                        card.innerHTML =
-                            '<div>' +
-
-                            '<h3 onclick="openModal(\'' +
-                            escapeJs(story.id) +
-                            '\')">' +
-
-                            escapeHtml(
-                                story.title
-                            ) +
-
-                            '</h3>' +
-
-                            '<div ' +
-                            'class="story-content-preview" ' +
-                            'onclick="openModal(\'' +
-                            escapeJs(story.id) +
-                            '\')">' +
-
-                            escapeHtml(
-                                story.content
-                            ) +
-
-                            '</div>' +
-
-                            '</div>' +
-
-                            '<div class="rating-stars">' +
-
-                            renderStarRating(
-                                story.id,
-                                story.rating
-                            ) +
-
-                            '</div>';
-
-                        container.appendChild(
-                            card
-                        );
-                    }
-                );
-
-                isLoading = false;
-
-                document.getElementById(
-                    'loading'
-                ).style.display = 'none';
-
-            })
-
-            .catch(() => {
-
-                isLoading = false;
-
-                document.getElementById(
-                    'loading'
-                ).style.display = 'none';
-
-                if (!syncRunning) {
-
-                    setStatus(
-                        'Errore durante il caricamento dell\'archivio.'
-                    );
-                }
-            });
-    }
-
-
-    function resetAndLoad() {
-
-        currentPage = 1;
-
-        hasMore = true;
-
-        loadStories(false);
-    }
-
-
-    /* ============================================================
-     * VOTO
-     * ============================================================ */
-
-    function rateStory(
-        id,
-        rating
-    ) {
-
-        const cleanId =
-            id.toString()
-                .replace('modal-', '');
-
-        fetch(
-            '?action=rate_story',
-            {
-                method: 'POST',
-
-                headers: {
-                    'Content-Type':
-                        'application/json'
-                },
-
-                body: JSON.stringify({
-                    id: cleanId,
-                    rating: rating
-                })
-            }
-        )
-
-            .then(res => res.json())
-
-            .then(data => {
-
-                if (
-                    data.status === 'success'
-                ) {
-
-                    if (
-                        globalStoriesMap[
-                            cleanId
-                            ]
-                    ) {
-
-                        globalStoriesMap[
-                            cleanId
-                            ].rating = rating;
-                    }
-
-                    /*
-                     * Aggiorniamo la visualizzazione senza
-                     * dover riscaricare i racconti dal server.
-                     */
-                    updateVisibleRatings(
-                        cleanId,
-                        rating
-                    );
-                }
-            });
-    }
-
-
-    function updateVisibleRatings(
-        id,
-        rating
-    ) {
-
-        const story =
-            globalStoriesMap[id];
-
-        if (!story) {
-            return;
-        }
-
-        /*
-         * Se il modal è aperto, aggiorniamo anche quello.
-         */
-        const modalStars =
-            document.getElementById(
-                'modal-stars'
-            );
-
-        if (
-            document.getElementById(
-                'modal-overlay'
-            ).style.display === 'flex'
-        ) {
-
-            modalStars.innerHTML =
-                renderStarRating(
-                    'modal-' + id,
-                    rating
-                );
-        }
-
-        /*
-         * La pagina viene ricaricata localmente dal DB.
-         * Nessun download remoto.
-         */
-        resetAndLoad();
-    }
-
-
-    /* ============================================================
-     * MODAL
-     * ============================================================ */
-
-    function openModal(
-        storyId
-    ) {
-
-        const story =
-            globalStoriesMap[storyId];
-
-        if (!story) {
-            return;
-        }
-
-        document.getElementById(
-            'modal-title'
-        ).innerText =
-            story.title;
-
-        document.getElementById(
-            'modal-body'
-        ).innerText =
-            story.content;
-
-        document.getElementById(
-            'modal-stars'
-        ).innerHTML =
-            renderStarRating(
-                'modal-' + story.id,
-                story.rating
-            );
-
-        document.getElementById(
-            'modal-overlay'
-        ).style.display = 'flex';
-
-        document.body.style.overflow =
-            'hidden';
-    }
-
-
-    function closeModal() {
-
-        document.getElementById(
-            'modal-overlay'
-        ).style.display = 'none';
-
-        document.body.style.overflow =
-            'auto';
-    }
-
-
-    function closeModalOnOutside(
-        event
-    ) {
-
-        if (
-            event.target.id ===
-            'modal-overlay'
-        ) {
-            closeModal();
-        }
-    }
-
-
-    /* ============================================================
-     * SINCRONIZZAZIONE
-     * ============================================================ */
-
-    function syncRemote(
-        manual = false
-    ) {
-
-        if (syncRunning) {
-            return;
-        }
-
-        syncRunning = true;
-
-        const button =
-            document.getElementById(
-                'sync-button'
-            );
-
-        button.disabled = true;
-
-        setStatus(
-            manual
-                ? 'Controllo del sito remoto...'
-                : 'Controllo aggiornamenti...',
-            true
-        );
-
-        fetch(
-            '?action=sync',
-            {
-                method: 'POST',
-                cache: 'no-store'
-            }
-        )
-
-            .then(res => res.json())
-
-            .then(data => {
-
-                if (
-                    data.status === 'busy'
-                ) {
-
-                    setStatus(
-                        'Un\'altra sincronizzazione è già in corso.'
-                    );
-
-                    return;
-                }
-
-                if (
-                    data.status !== 'success'
-                ) {
-
-                    throw new Error(
-                        data.message ||
-                        'Errore sincronizzazione'
-                    );
-                }
-
-                const newStories =
-                    Number(
-                        data.new_stories || 0
-                    );
-
-                const pages =
-                    Number(
-                        data.pages_checked || 0
-                    );
-
-                if (newStories > 0) {
-
-                    setStatus(
-                        'Sincronizzazione completata: ' +
-                        newStories +
-                        ' nuovi racconti.'
-                    );
-
-                    /*
-                     * Aggiorniamo l'elenco locale.
-                     */
-                    currentPage = 1;
-
-                    loadStories(false);
-
-                } else {
-
-                    setStatus(
-                        'Archivio aggiornato: nessun nuovo racconto.'
-                    );
-                }
-
-            })
-
-            .catch(() => {
-
-                setStatus(
-                    'Impossibile sincronizzare il sito remoto. ' +
-                    'L\'archivio locale resta disponibile.'
-                );
-
-            })
-
-            .finally(() => {
-
-                syncRunning = false;
-
-                button.disabled = false;
-            });
-    }
-
-
-    function manualSync() {
-
-        syncRemote(true);
-    }
-
-
-    /* ============================================================
-     * SICUREZZA HTML / JS
-     * ============================================================ */
-
-    function escapeHtml(
-        text
-    ) {
-
-        const map = {
-            '&': '&amp;',
-            '<': '&lt;',
-            '>': '&gt;',
-            '"': '&quot;',
-            "'": '&#039;'
-        };
-
-        return String(text)
-            .replace(
-                /[&<>"']/g,
-                m => map[m]
-            );
-    }
-
-
-    function escapeJs(
-        text
-    ) {
-
-        return String(text)
-            .replace(
-                /\\/g,
-                '\\\\'
-            )
-            .replace(
-                /'/g,
-                "\\'"
-            )
-            .replace(
-                /"/g,
-                '\\"'
-            )
-            .replace(
-                /\r/g,
-                '\\r'
-            )
-            .replace(
-                /\n/g,
-                '\\n'
-            );
-    }
-
-
-    /* ============================================================
-     * SCROLL INFINITO
-     * ============================================================ */
-
-    window.addEventListener(
-        'scroll',
-        () => {
-
-            if (
-                window.innerHeight +
-                window.scrollY >=
-                document.body.offsetHeight - 500
-            ) {
-
-                if (
-                    hasMore &&
-                    !isLoading
-                ) {
-
-                    currentPage++;
-
-                    loadStories(true);
-                }
-            }
-        }
-    );
-
-
-    /* ============================================================
-     * AVVIO
-     * ============================================================ */
-
-    /*
-     * 1. Mostriamo IMMEDIATAMENTE l'archivio locale.
-     *
-     * 2. In parallelo avviamo il controllo remoto.
-     *
-     * Quindi l'utente non deve aspettare la sincronizzazione
-     * per poter leggere i racconti già presenti.
-     */
-    loadStories(false);
-
-    syncRemote(false);
-
-</script>
-
-</body>
-</html>
-
+    const S={offset:0,loading:false,more:true,words:[],sort:'date',dir:'desc',theme:localStorage.getItem('theme')||'light'};
+    const $=id=>document.getElementById(id); document.documentElement.dataset.theme=S.theme;
+    function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c]));}
+    function stars(r,id){let h='<span class="stars">';for(let i=1;i<=5;i++)h+=`<button class="star ${i<=r?'on':''}" data-id="${id}" data-rating="${i}">★</button>`;return h+'</span>';}
+    function chips(){ $('chips').innerHTML=S.words.map((w,i)=>`<span class="chip">${esc(w)} <button data-word="${i}">×</button></span>`).join('');}
+    function query(){return S.words.join(' ')}
+    async function api(u,opt){const r=await fetch(u,opt);return r.json();}
+    async function load(reset=false){if(S.loading||(!S.more&&!reset))return;S.loading=true;if(reset){S.offset=0;S.more=true;$('grid').innerHTML='';} $('loader').textContent='Caricamento…';let [sort,dir]=$('sort').value.split(':');S.sort=sort;S.dir=dir;let p=new URLSearchParams({action:'stories',offset:S.offset,limit:16,sort,dir,q:query()});let d=await api('?'+p);for(const x of d.items){const el=document.createElement('article');el.className='card';el.innerHTML=`<h2>${esc(x.title)}</h2><div class="meta">${esc(x.author||'Autore non indicato')} · ${esc(x.published_at||'Data non indicata')}</div><div class="preview" data-id="${x.id}">${esc(x.preview)}</div><div class="bottom">${stars(x.rating,x.id)}<button class="read" data-id="${x.id}">Leggi</button></div>`;$('grid').appendChild(el);}S.offset+=d.items.length;S.more=S.offset<d.total;$('loader').textContent=S.more?'Scorri per caricare altri racconti':'Fine dei risultati';S.loading=false;updateProgress(d.progress);}
+    function updateProgress(p){let pagePct=p.total_pages?Math.round(p.pages_done*100/p.total_pages):0;let storyPct=p.stories_total?Math.round(p.stories_done*100/p.stories_total):0;$('fill').style.width=Math.max(pagePct,storyPct)+'%';$('status').innerHTML=`Pagine: <b>${p.pages_done}/${p.total_pages}</b> · Racconti: <b>${p.stories_done}/${p.stories_total}</b> · In coda: ${p.stories_pending} · Stato: <b>${esc(p.worker)}</b>${p.last_error?' · '+esc(p.last_error):''}`;}
+    async function progress(){try{let d=await api('?action=progress');updateProgress(d.progress);if(d.progress.worker==='running'&&S.timer==null)S.timer=setInterval(progress,1500);if(d.progress.worker!=='running'&&S.timer){clearInterval(S.timer);S.timer=null;load(true);}}catch(e){}}
+    $('start').onclick=async()=>{let d=await api('?action=start');updateProgress(d.progress);if(d.spawned){if(!S.timer)S.timer=setInterval(progress,1500);}else alert('Il server non ha potuto avviare il worker CLI. Abilita proc_open/CLI PHP oppure configura un cron che esegua questo file con --worker.');load(true);};
+    $('stop').onclick=async()=>{await api('?action=stop');progress();};
+    $('theme').onclick=()=>{S.theme=S.theme==='dark'?'light':'dark';document.documentElement.dataset.theme=S.theme;localStorage.setItem('theme',S.theme);};
+    $('sort').onchange=()=>load(true);
+    $('search').onkeydown=e=>{if(e.key==='Enter'){let v=e.target.value.trim();if(v&&!S.words.includes(v))S.words.push(v);e.target.value='';chips();load(true);}};
+    $('clearSearch').onclick=()=>{S.words=[];chips();load(true);};
+    $('chips').onclick=e=>{let i=e.target.dataset.word;if(i!==undefined){S.words.splice(+i,1);chips();load(true);}};
+    $('grid').onclick=async e=>{let r=e.target.closest('.read,.preview');if(r){let d=await api('?action=story&id='+r.dataset.id);if(d.ok){$('rt').textContent=d.story.title;$('rm').textContent=(d.story.author||'Autore non indicato')+' · '+(d.story.published_at||'');$('rs').innerHTML=stars(d.story.rating,d.story.id);$('rb').textContent=d.story.content;$('modal').classList.add('show');}}
+        let st=e.target.closest('.star');if(st){e.stopPropagation();await api('?action=rate',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({id:st.dataset.id,rating:st.dataset.rating})});load(true);}}
+    $('close').onclick=()=>$('modal').classList.remove('show');$('modal').onclick=e=>{if(e.target===$('modal'))$('modal').classList.remove('show');};document.addEventListener('keydown',e=>{if(e.key==='Escape')$('modal').classList.remove('show');});
+    window.addEventListener('scroll',()=>{if(innerHeight+scrollY>document.documentElement.scrollHeight-700)load(false);});
+    chips();load(true);progress();
+</script></body></html>
