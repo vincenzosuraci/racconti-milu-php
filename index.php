@@ -39,6 +39,31 @@ if (isset($_GET['api'])) {
 
     try {
         switch ($_GET['api']) {
+
+            case 'fix_entities':
+                $stmt = $pdo->query("SELECT hash, title, content FROM stories");
+                $stories = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+                $updateStmt = $pdo->prepare("UPDATE stories SET title = ?, content = ? WHERE hash = ?");
+                $updatedCount = 0;
+
+                foreach ($stories as $story) {
+                    // Aggiunge il ';' mancante se l'entità è incompleta (es. &egrave -> &egrave;)
+                    $titleFixed = preg_replace('/&([a-zA-Z]+)(?![a-zA-Z0-9#;])/', '&$1;', $story['title']);
+                    $titleClean = html_entity_decode($titleFixed, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+
+                    $contentFixed = preg_replace('/&([a-zA-Z]+)(?![a-zA-Z0-9#;])/', '&$1;', $story['content']);
+                    $contentClean = html_entity_decode($contentFixed, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+
+                    if ($titleClean !== $story['title'] || $contentClean !== $story['content']) {
+                        $updateStmt->execute([$titleClean, $contentClean, $story['hash']]);
+                        $updatedCount++;
+                    }
+                }
+
+                echo json_encode(['success' => true, 'updated' => $updatedCount]);
+                break;
+
             case 'get_count':
                 $total = (int)$pdo->query("SELECT COUNT(*) FROM stories")->fetchColumn();
                 echo json_encode(['total' => $total]);
@@ -141,6 +166,10 @@ if (isset($_GET['api'])) {
                     $cleanContent = "Contenuto non trovato.";
                 }
 
+                // Normalizza entità senza ';' e decodifica in UTF-8 reale
+                $title = html_entity_decode(preg_replace('/&([a-zA-Z]+)(?![a-zA-Z0-9#;])/', '&$1;', $title), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+                $cleanContent = html_entity_decode(preg_replace('/&([a-zA-Z]+)(?![a-zA-Z0-9#;])/', '&$1;', $cleanContent), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+
                 $stmt = $pdo->prepare("
                     INSERT INTO stories (hash, title, author, pub_date, content, url) 
                     VALUES (?, ?, ?, ?, ?, ?)
@@ -162,15 +191,26 @@ if (isset($_GET['api'])) {
                 $offset = isset($_GET['offset']) ? intval($_GET['offset']) : 0;
                 $sort = $_GET['sort'] ?? 'date_desc';
 
-                $keywords = isset($_GET['keywords']) ? json_decode($_GET['keywords'], true) : [];
+                $rawKw = $_GET['keywords'] ?? '';
+                $keywords = json_decode($rawKw, true);
+                if (!is_array($keywords)) {
+                    $keywords = [];
+                }
+
                 $whereClauses = [];
                 $params = [];
 
-                if (is_array($keywords)) {
-                    foreach ($keywords as $i => $kw) {
-                        $whereClauses[] = "(title LIKE :kw$i OR content LIKE :kw$i)";
-                        $params[":kw$i"] = "%" . $kw . "%";
-                    }
+                foreach ($keywords as $i => $kw) {
+                    // Compatta spazi multipli o tabulazioni nella locuzione cercata
+                    $kwClean = trim(preg_replace('/\s+/', ' ', $kw));
+                    if ($kwClean === '') continue;
+
+                    // Normalizza a capo e &nbsp; presenti nel campo content in SQLite
+                    $whereClauses[] = "(
+            title LIKE :kw$i 
+            OR REPLACE(REPLACE(REPLACE(content, CHAR(10), ' '), CHAR(13), ' '), '&nbsp;', ' ') LIKE :kw$i
+        )";
+                    $params[":kw$i"] = "%" . $kwClean . "%";
                 }
 
                 $whereSql = count($whereClauses) > 0 ? "WHERE " . implode(" AND ", $whereClauses) : "";
@@ -334,7 +374,7 @@ if (isset($_GET['api'])) {
         <div class="control-group">
             <h2 style="margin: 0; font-size: 20px; display: flex; align-items: center; gap: 10px;">
                 Racconti Dominazione
-                <span class="db-count-badge" id="dbCountBadge">DB: <strong>0</strong></span>
+                <span class="db-count-badge" id="dbCountBadge">📁 racconti: <strong>0</strong></span>
             </h2>
             <button id="themeToggle" title="Cambia Tema">🌓</button>
         </div>
@@ -424,10 +464,19 @@ if (isset($_GET['api'])) {
     function renderKeywords() {
         document.querySelectorAll('.tag').forEach(el => el.remove());
         keywords.slice().reverse().forEach(word => {
-            const span = document.createElement('div');
-            span.className = 'tag';
-            span.innerHTML = `${escapeHtml(word)} <span onclick="removeKeyword('${escapeHtml(word)}')">&times;</span>`;
-            searchContainer.insertBefore(span, searchInput);
+            const tagEl = document.createElement('div');
+            tagEl.className = 'tag';
+
+            const textNode = document.createTextNode(word + ' ');
+            tagEl.appendChild(textNode);
+
+            const closeBtn = document.createElement('span');
+            closeBtn.innerHTML = '&times;';
+            closeBtn.style.cursor = 'pointer';
+            closeBtn.addEventListener('click', () => removeKeyword(word));
+
+            tagEl.appendChild(closeBtn);
+            searchContainer.insertBefore(tagEl, searchInput);
         });
     }
 
@@ -445,14 +494,23 @@ if (isset($_GET['api'])) {
         return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#039;");
     }
 
+    function formatNumber(val) {
+        if (val === null || val === undefined) return '0';
+        return val.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ".");
+    }
+
     // Aggiorna il badge del numero di racconti nel DB
     function updateDbCount(total, filtered = null) {
         const badge = document.getElementById('dbCountBadge');
         if (!badge) return;
+
+        const formattedTotal = formatNumber(total);
+
         if (filtered !== null && keywords.length > 0) {
-            badge.innerHTML = `DB: <strong>${total}</strong> <small style="opacity:0.8;">(${filtered} filtrati)</small>`;
+            const formattedFiltered = formatNumber(filtered);
+            badge.innerHTML = `📁 racconti: <strong>${formattedTotal}</strong> <small style="opacity:0.8;">(${formattedFiltered} filtrati)</small>`;
         } else {
-            badge.innerHTML = `DB: <strong>${total}</strong>`;
+            badge.innerHTML = `📁 racconti: <strong>${formattedTotal}</strong>`;
         }
     }
 
