@@ -4,6 +4,66 @@
 // ==========================================
 session_start();
 
+// Credenziali di accesso (hardcoded)
+const LOGIN_USERNAME = 'admin';
+const LOGIN_PASSWORD = 'icarus78';
+
+// Logout
+if (isset($_GET['logout'])) {
+    unset($_SESSION['logged_in']);
+    header('Location: ' . strtok($_SERVER['REQUEST_URI'], '?'));
+    exit;
+}
+
+// Login
+$loginError = '';
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['username'], $_POST['password'])) {
+    if (hash_equals(LOGIN_USERNAME, $_POST['username']) && hash_equals(LOGIN_PASSWORD, $_POST['password'])) {
+        $_SESSION['logged_in'] = true;
+        header('Location: ' . strtok($_SERVER['REQUEST_URI'], '?'));
+        exit;
+    }
+    $loginError = 'Username o password non validi.';
+}
+
+// Blocca l'accesso (pagina e API) se non autenticato
+if (empty($_SESSION['logged_in'])) {
+    if (isset($_GET['api'])) {
+        header('Content-Type: application/json');
+        http_response_code(401);
+        echo json_encode(['error' => 'Non autenticato']);
+        exit;
+    }
+    ?>
+    <!DOCTYPE html>
+    <html lang="it">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Login - Racconti Erotici</title>
+        <style>
+            body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #f4f4f9; color: #333; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
+            .login-box { background: #fff; padding: 30px 35px; border-radius: 8px; box-shadow: 0 4px 10px rgba(0,0,0,0.1); width: 300px; }
+            .login-box h2 { margin-top: 0; text-align: center; color: #d63384; }
+            .login-box input { width: 100%; box-sizing: border-box; padding: 10px; margin-bottom: 12px; border: 1px solid #ddd; border-radius: 5px; }
+            .login-box button { width: 100%; padding: 10px; border: none; border-radius: 5px; background: #d63384; color: #fff; font-weight: bold; cursor: pointer; }
+            .error { color: #dc3545; font-size: 13px; margin-bottom: 10px; text-align: center; }
+        </style>
+    </head>
+    <body>
+        <form class="login-box" method="post">
+            <h2>Accesso</h2>
+            <?php if ($loginError): ?><div class="error"><?= htmlspecialchars($loginError) ?></div><?php endif; ?>
+            <input type="text" name="username" placeholder="Username" autofocus required>
+            <input type="password" name="password" placeholder="Password" required>
+            <button type="submit">Accedi</button>
+        </form>
+    </body>
+    </html>
+    <?php
+    exit;
+}
+
 // Configurazione DB SQLite
 $dbFile = __DIR__ . '/racconti.sqlite';
 $pdo = new PDO("sqlite:" . $dbFile);
@@ -19,6 +79,65 @@ $pdo->exec("CREATE TABLE IF NOT EXISTS stories (
     url TEXT,
     rating INTEGER DEFAULT 0
 )");
+
+// Converte una data testuale (es. "13 Settembre 2026" o "13/09/2026") in formato ISO "YYYY-MM-DD",
+// così l'ordinamento cronologico funziona con un semplice ORDER BY testuale.
+// Ritorna null se il formato non è riconosciuto (in tal caso il valore originale viene mantenuto).
+function parseDateToIso($text) {
+    $text = trim($text ?? '');
+    if ($text === '') return null;
+
+    static $months = [
+        'gennaio' => 1, 'febbraio' => 2, 'marzo' => 3, 'aprile' => 4,
+        'maggio' => 5, 'giugno' => 6, 'luglio' => 7, 'agosto' => 8,
+        'settembre' => 9, 'ottobre' => 10, 'novembre' => 11, 'dicembre' => 12
+    ];
+
+    // Formato "13 Settembre 2026" (con eventuale testo attorno, es. "Pubblicato il 13 Settembre 2026")
+    if (preg_match('/(\d{1,2})\s+([A-Za-zàèéìòù]+)\s+(\d{4})/u', $text, $m)) {
+        $monthName = mb_strtolower($m[2], 'UTF-8');
+        if (isset($months[$monthName])) {
+            return sprintf('%04d-%02d-%02d', (int)$m[3], $months[$monthName], (int)$m[1]);
+        }
+    }
+
+    // Formato numerico "13/09/2026" o "13-09-2026"
+    if (preg_match('/(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})/', $text, $m)) {
+        return sprintf('%04d-%02d-%02d', (int)$m[3], (int)$m[2], (int)$m[1]);
+    }
+
+    // Già in formato ISO "2026-09-13[...]"
+    if (preg_match('/^(\d{4})-(\d{2})-(\d{2})/', $text, $m)) {
+        return sprintf('%04d-%02d-%02d', (int)$m[1], (int)$m[2], (int)$m[3]);
+    }
+
+    return null;
+}
+
+// Rimuove dal frammento HTML tutti gli elementi che hanno la classe CSS indicata (gestisce correttamente markup annidato)
+function stripElementsByClass($html, $class) {
+    if (trim($html ?? '') === '') return $html;
+
+    $dom = new DOMDocument();
+    libxml_use_internal_errors(true);
+    @$dom->loadHTML('<?xml encoding="UTF-8"><div id="__wrapper__">' . $html . '</div>');
+    libxml_clear_errors();
+
+    $xpath = new DOMXPath($dom);
+    $nodes = $xpath->query("//*[contains(concat(' ', normalize-space(@class), ' '), ' $class ')]");
+    foreach ($nodes as $node) {
+        $node->parentNode->removeChild($node);
+    }
+
+    $wrapper = $xpath->query("//div[@id='__wrapper__']")->item(0);
+    if (!$wrapper) return $html;
+
+    $result = '';
+    foreach ($wrapper->childNodes as $child) {
+        $result .= $dom->saveHTML($child);
+    }
+    return $result;
+}
 
 // Funzione helper per le richieste cURL
 function fetchHtml($url) {
@@ -57,6 +176,67 @@ if (isset($_GET['api'])) {
 
                     if ($titleClean !== $story['title'] || $contentClean !== $story['content']) {
                         $updateStmt->execute([$titleClean, $contentClean, $story['hash']]);
+                        $updatedCount++;
+                    }
+                }
+
+                echo json_encode(['success' => true, 'updated' => $updatedCount]);
+                break;
+
+            case 'fix_dates':
+                // Converte le date già salvate (testo in italiano, es. "13 Settembre 2026") in formato ISO "YYYY-MM-DD",
+                // così l'ordinamento "Più recenti"/"Meno recenti" rispetta correttamente anno/mese/giorno.
+                $stmt = $pdo->query("SELECT hash, pub_date FROM stories");
+                $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+                $updateStmt = $pdo->prepare("UPDATE stories SET pub_date = ? WHERE hash = ?");
+                $updatedCount = 0;
+                $skippedCount = 0;
+
+                foreach ($rows as $row) {
+                    $iso = parseDateToIso($row['pub_date']);
+                    if ($iso !== null && $iso !== $row['pub_date']) {
+                        $updateStmt->execute([$iso, $row['hash']]);
+                        $updatedCount++;
+                    } elseif ($iso === null) {
+                        $skippedCount++;
+                    }
+                }
+
+                echo json_encode(['success' => true, 'updated' => $updatedCount, 'skipped' => $skippedCount]);
+                break;
+
+            case 'fix_images':
+                // Rimuove i tag <img> (incluse le eventuali varianti self-closed) dal contenuto già salvato.
+                $stmt = $pdo->query("SELECT hash, content FROM stories");
+                $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+                $updateStmt = $pdo->prepare("UPDATE stories SET content = ? WHERE hash = ?");
+                $updatedCount = 0;
+
+                foreach ($rows as $row) {
+                    $cleanContent = preg_replace('/<img\b[^>]*>/i', '', $row['content']);
+                    if ($cleanContent !== $row['content']) {
+                        $updateStmt->execute([$cleanContent, $row['hash']]);
+                        $updatedCount++;
+                    }
+                }
+
+                echo json_encode(['success' => true, 'updated' => $updatedCount]);
+                break;
+
+            case 'fix_related':
+                // Rimuove il blocco <div class="milu-related">...</div> dal contenuto già salvato.
+                $stmt = $pdo->query("SELECT hash, content FROM stories");
+                $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+                $updateStmt = $pdo->prepare("UPDATE stories SET content = ? WHERE hash = ?");
+                $updatedCount = 0;
+
+                foreach ($rows as $row) {
+                    $cleanContent = stripElementsByClass($row['content'], 'milu-related');
+                    if ($cleanContent !== $row['content']) {
+                        $updateStmt->execute([$cleanContent, $row['hash']]);
                         $updatedCount++;
                     }
                 }
@@ -134,9 +314,14 @@ if (isset($_GET['api'])) {
                 $authorNode = $xpath->query('//a[@rel="author"] | //span[contains(@class, "author")] | //div[contains(@class, "author")]')->item(0);
                 $author = $authorNode ? trim($authorNode->nodeValue) : 'Anonimo';
 
-                // Estrazione Data
+                // Estrazione Data (preferisce l'attributo datetime del tag <time>, se presente, altrimenti il testo visibile)
                 $dateNode = $xpath->query('//time | //span[contains(@class, "date")] | //span[contains(@class, "posted-on")]')->item(0);
-                $date = $dateNode ? trim($dateNode->nodeValue) : '';
+                $dateText = $dateNode ? trim($dateNode->nodeValue) : '';
+                $dateAttr = ($dateNode && $dateNode->nodeName === 'time') ? trim($dateNode->getAttribute('datetime')) : '';
+
+                $dateIso = parseDateToIso($dateAttr) ?? parseDateToIso($dateText);
+                // Salva in formato ISO (ordinabile cronologicamente); se il formato non è riconosciuto, mantiene il testo originale
+                $date = $dateIso ?? $dateText;
 
                 // Estrazione Contenuto
                 $contentNode = $xpath->query(
@@ -162,6 +347,8 @@ if (isset($_GET['api'])) {
 
                 if (!empty(trim($rawHtml))) {
                     $cleanContent = preg_replace('/<a\b[^>]*>(.*?)<\/a>/is', '$1', $rawHtml);
+                    $cleanContent = preg_replace('/<img\b[^>]*>/i', '', $cleanContent);
+                    $cleanContent = stripElementsByClass($cleanContent, 'milu-related');
                 } else {
                     $cleanContent = "Contenuto non trovato.";
                 }
@@ -377,6 +564,7 @@ if (isset($_GET['api'])) {
                 <span class="db-count-badge" id="dbCountBadge">📁 racconti: <strong>0</strong></span>
             </h2>
             <button id="themeToggle" title="Cambia Tema">🌓</button>
+            <a href="?logout" style="text-decoration:none;"><button type="button" title="Esci">🚪 Logout</button></a>
         </div>
 
         <div class="search-container" id="searchContainer">
@@ -494,6 +682,15 @@ if (isset($_GET['api'])) {
         return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#039;");
     }
 
+    // Formatta una data ISO ("YYYY-MM-DD") in formato leggibile italiano; se il formato non è riconosciuto, ritorna il valore originale
+    function formatDate(val) {
+        if (!val) return '';
+        const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(val);
+        if (!m) return val;
+        const d = new Date(Date.UTC(parseInt(m[1]), parseInt(m[2]) - 1, parseInt(m[3])));
+        return d.toLocaleDateString('it-IT', { day: 'numeric', month: 'long', year: 'numeric', timeZone: 'UTC' });
+    }
+
     function formatNumber(val) {
         if (val === null || val === undefined) return '0';
         return val.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ".");
@@ -580,7 +777,7 @@ if (isset($_GET['api'])) {
 
                 card.innerHTML = `
                     <div class="card-title">${escapeHtml(story.title)}</div>
-                    <div class="card-meta">Di ${escapeHtml(story.author)} - ${escapeHtml(story.pub_date || 'Data sconosciuta')}</div>
+                    <div class="card-meta">Di ${escapeHtml(story.author)} - ${escapeHtml(formatDate(story.pub_date) || 'Data sconosciuta')}</div>
                     <div class="card-excerpt">${escapeHtml(story.excerpt)}...</div>
                     ${renderRatingHtml(story.hash, parseInt(story.rating) || 0)}
                 `;
@@ -626,7 +823,7 @@ if (isset($_GET['api'])) {
 
     function openModal(story) {
         document.getElementById('modalTitle').innerText = story.title;
-        document.getElementById('modalMeta').innerText = `Autore: ${story.author} | Data: ${story.pub_date || 'Sconosciuta'}`;
+        document.getElementById('modalMeta').innerText = `Autore: ${story.author} | Data: ${formatDate(story.pub_date) || 'Sconosciuta'}`;
         document.getElementById('modalRating').innerHTML = renderRatingHtml(story.hash, parseInt(story.rating) || 0);
         document.getElementById('modalBody').innerHTML = story.content;
         document.getElementById('readerModal').style.display = 'block';
