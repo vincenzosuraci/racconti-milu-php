@@ -400,6 +400,14 @@ if (isset($_GET['api'])) {
                     $params[":kw$i"] = "%" . $kwClean . "%";
                 }
 
+                // Filtro per autore (corrispondenza esatta)
+                // Normalizza &nbsp; e spazi ai bordi; autore vuoto/NULL = 'Anonimo' (come mostrato in pagina)
+                $authorFilter = isset($_GET['author']) ? trim(str_replace("\xC2\xA0", ' ', $_GET['author'])) : '';
+                if ($authorFilter !== '') {
+                    $whereClauses[] = "COALESCE(NULLIF(TRIM(REPLACE(REPLACE(REPLACE(REPLACE(author, char(160), ' '), CHAR(10), ' '), CHAR(13), ' '), CHAR(9), ' ')), ''), 'Anonimo') = :author";
+                    $params[':author'] = $authorFilter;
+                }
+
                 $whereSql = count($whereClauses) > 0 ? "WHERE " . implode(" AND ", $whereClauses) : "";
 
                 switch ($sort) {
@@ -511,6 +519,9 @@ if (isset($_GET['api'])) {
         .search-container input { border: none; outline: none; flex-grow: 1; background: transparent; color: var(--text-color); padding: 5px; }
         .tag { background: var(--primary); color: white; padding: 2px 8px; border-radius: 12px; font-size: 12px; display: flex; align-items: center; gap: 5px; }
         .tag span { cursor: pointer; font-weight: bold; }
+        .tag.tag-author { background: var(--secondary); }
+        .author-link { color: var(--primary); cursor: pointer; text-decoration: underline; text-underline-offset: 2px; }
+        .author-link:hover { opacity: 0.8; }
 
         .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 20px; padding: 20px; max-width: 1400px; margin: 0 auto; }
         @media(max-width: 1024px) { .grid { grid-template-columns: repeat(3, 1fr); } }
@@ -551,7 +562,9 @@ if (isset($_GET['api'])) {
         .modal-header-info { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; margin-bottom: 10px; }
         .modal-close { position: absolute; top: 15px; right: 20px; font-size: 28px; cursor: pointer; font-weight: bold; color: var(--secondary); }
 
-        .loader { text-align: center; padding: 30px; color: var(--secondary); font-style: italic; min-height: 50px; }
+        .loader { text-align: center; padding: 30px; color: var(--secondary); font-style: italic; min-height: 50px; display: flex; justify-content: center; align-items: center; }
+        .spinner { width: 36px; height: 36px; border: 4px solid var(--border); border-top-color: var(--primary); border-radius: 50%; animation: spin 0.8s linear infinite; }
+        @keyframes spin { to { transform: rotate(360deg); } }
     </style>
 </head>
 <body>
@@ -595,7 +608,7 @@ if (isset($_GET['api'])) {
 </header>
 
 <div class="grid" id="storyGrid"></div>
-<div id="scrollSentinel" class="loader">Scorri per caricare altri racconti...</div>
+<div id="scrollSentinel" class="loader"><div class="spinner" title="Caricamento..."></div></div>
 
 <div class="modal" id="readerModal">
     <div class="modal-content">
@@ -623,8 +636,10 @@ if (isset($_GET['api'])) {
 
     let offset = 0;
     let isLoading = false;
+    let loadToken = 0;
     let hasMore = true;
     let keywords = [];
+    let authorFilter = '';
 
     const searchInput = document.getElementById('searchInput');
     const searchContainer = document.getElementById('searchContainer');
@@ -666,14 +681,61 @@ if (isset($_GET['api'])) {
             tagEl.appendChild(closeBtn);
             searchContainer.insertBefore(tagEl, searchInput);
         });
+
+        // Tag del filtro autore (sempre per primo)
+        if (authorFilter) {
+            const tagEl = document.createElement('div');
+            tagEl.className = 'tag tag-author';
+            tagEl.title = 'Filtro autore';
+            tagEl.appendChild(document.createTextNode('✍️ ' + authorFilter + ' '));
+
+            const closeBtn = document.createElement('span');
+            closeBtn.innerHTML = '&times;';
+            closeBtn.addEventListener('click', clearAuthorFilter);
+
+            tagEl.appendChild(closeBtn);
+            searchContainer.insertBefore(tagEl, searchContainer.firstChild);
+        }
+    }
+
+    // Mostra tutti i racconti dell'autore indicato
+    function filterByAuthor(author) {
+        if (!author) return;
+        authorFilter = author;
+        closeModal();
+        renderKeywords();
+        reloadGrid();
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+    }
+
+    function clearAuthorFilter() {
+        authorFilter = '';
+        renderKeywords();
+        reloadGrid();
+    }
+
+    // Crea uno span cliccabile con il nome dell'autore
+    function createAuthorLink(author) {
+        const el = document.createElement('span');
+        el.className = 'author-link';
+        el.textContent = author || 'Anonimo';
+        el.title = 'Mostra tutti i racconti di questo autore';
+        el.addEventListener('click', (e) => {
+            e.stopPropagation();
+            filterByAuthor(author);
+        });
+        return el;
     }
 
     document.getElementById('sortSelect').addEventListener('change', reloadGrid);
 
     function reloadGrid() {
         document.getElementById('storyGrid').innerHTML = '';
+        document.getElementById('scrollSentinel').innerHTML = '<div class="spinner" title="Caricamento..."></div>';
         offset = 0;
         hasMore = true;
+        loadToken++;        // invalida eventuali richieste ancora in corso
+        isLoading = false;
         loadStories();
     }
 
@@ -703,7 +765,7 @@ if (isset($_GET['api'])) {
 
         const formattedTotal = formatNumber(total);
 
-        if (filtered !== null && keywords.length > 0) {
+        if (filtered !== null && (keywords.length > 0 || authorFilter)) {
             const formattedFiltered = formatNumber(filtered);
             badge.innerHTML = `📁 racconti: <strong>${formattedTotal}</strong> <small style="opacity:0.8;">(${formattedFiltered} filtrati)</small>`;
         } else {
@@ -742,16 +804,21 @@ if (isset($_GET['api'])) {
     async function loadStories() {
         if (isLoading || !hasMore) return;
         isLoading = true;
+        const myToken = loadToken;
 
         const sort = document.getElementById('sortSelect').value;
         const kwJson = encodeURIComponent(JSON.stringify(keywords));
         const sentinel = document.getElementById('scrollSentinel');
 
         try {
-            const res = await fetch(`?api=get_stories&offset=${offset}&sort=${sort}&keywords=${kwJson}`);
+            const authorParam = authorFilter ? `&author=${encodeURIComponent(authorFilter)}` : '';
+            const res = await fetch(`?api=get_stories&offset=${offset}&sort=${sort}&keywords=${kwJson}${authorParam}`);
             if (!res.ok) throw new Error(`HTTP Error ${res.status}`);
 
             const data = await res.json();
+
+            // Risposta di una richiesta superata (filtro/ordinamento cambiato nel frattempo): scartala
+            if (myToken !== loadToken) return;
 
             // Retrocompatibilità sia per la nuova struttura che per eventuale array piano
             const stories = Array.isArray(data) ? data : (data.stories || []);
@@ -777,10 +844,11 @@ if (isset($_GET['api'])) {
 
                 card.innerHTML = `
                     <div class="card-title">${escapeHtml(story.title)}</div>
-                    <div class="card-meta">Di ${escapeHtml(story.author)} - ${escapeHtml(formatDate(story.pub_date) || 'Data sconosciuta')}</div>
+                    <div class="card-meta">Di <span class="author-slot"></span> - ${escapeHtml(formatDate(story.pub_date) || 'Data sconosciuta')}</div>
                     <div class="card-excerpt">${escapeHtml(story.excerpt)}...</div>
                     ${renderRatingHtml(story.hash, parseInt(story.rating) || 0)}
                 `;
+                card.querySelector('.author-slot').replaceWith(createAuthorLink(story.author));
                 grid.appendChild(card);
             });
 
@@ -791,13 +859,15 @@ if (isset($_GET['api'])) {
                     ? 'Nessun racconto presente nel database. Clicca su "Avvia Download".'
                     : 'Nessun altro racconto.';
             } else {
-                sentinel.innerText = 'Scorri per caricare altri racconti...';
+                sentinel.innerHTML = '<div class="spinner" title="Caricamento..."></div>';
             }
         } catch(e) {
             console.error("Errore nel caricamento:", e);
         } finally {
-            isLoading = false;
-            checkSentinel();
+            if (myToken === loadToken) {
+                isLoading = false;
+                checkSentinel();
+            }
         }
     }
 
@@ -823,7 +893,10 @@ if (isset($_GET['api'])) {
 
     function openModal(story) {
         document.getElementById('modalTitle').innerText = story.title;
-        document.getElementById('modalMeta').innerText = `Autore: ${story.author} | Data: ${formatDate(story.pub_date) || 'Sconosciuta'}`;
+        const meta = document.getElementById('modalMeta');
+        meta.textContent = 'Autore: ';
+        meta.appendChild(createAuthorLink(story.author));
+        meta.appendChild(document.createTextNode(` | Data: ${formatDate(story.pub_date) || 'Sconosciuta'}`));
         document.getElementById('modalRating').innerHTML = renderRatingHtml(story.hash, parseInt(story.rating) || 0);
         document.getElementById('modalBody').innerHTML = story.content;
         document.getElementById('readerModal').style.display = 'block';
